@@ -42,7 +42,9 @@ nonebot-plugin-bili2mp4 是一个用于 NoneBot2 的插件，主要功能包括�
 
 ## 📦 依赖
 
-- yt-dlp - 视频下载工具
+- yt-dlp - 
+
+如果创建项目时使用了虚拟环境请在虚拟环境内安装依赖
 ```bash
 pip install yt-dlp
 ```
@@ -91,7 +93,10 @@ brew install ffmpeg
 | 查看参数 | 查看当前配置参数 |
 | 查看转换列表 | 查看已开启转换功能的群列表 |
 
-**注意**：Cookie中至少需要包含SESSDATA、bili_jct、DedeUserID和buvid3/buvid4四个字段，并且是大会员账号的cookie，否则无法保证能转化大会员视频与清晰度。
+**注意**：
+以上指令均需超级管理员私聊bot
+
+Cookie中至少需要包含SESSDATA、bili_jct、DedeUserID和buvid3/buvid4四个字段，并且是大会员账号的cookie，否则无法保证能转化大会员视频与清晰度。
 ## 效果图
 <img src="images/picture1.png" width="500">
 <img src="images/picture2.png" width="500">

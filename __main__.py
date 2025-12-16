@@ -1,16 +1,16 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
 import os
 import re
-import sys
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 from typing import List, Optional, Set, Tuple
-from urllib.parse import unquote, urlparse, parse_qs
+from urllib.parse import parse_qs, unquote, urlparse
 
 from loguru import logger
 from nonebot import on_message
@@ -32,85 +32,44 @@ FFMPEG_CHECK_TIMEOUT = int(os.getenv("BILI2MP4_FFMPEG_TIMEOUT", "30"))
 
 # 配置加载
 plugin_config = get_plugin_config(Config)
-super_admins: List[int] = plugin_config.super_admins or [3200825668]
+super_admins: List[int] = plugin_config.super_admins or []
 logger.info(f"nonebot_plugin_bili2mp4 初始化：超管={super_admins}")
 
-# 固定使用此目录中的 ffmpeg/ffprobe（请确保该路径存在并包含 ffmpeg.exe 与 ffprobe.exe）
-HARD_CODED_FFMPEG_DIR = r"C:\Users\Administrator\Desktop\nonebot\yousa\.venv\ffmpeg\bin"
+# FFmpeg 设置
 FFMPEG_DIR: Optional[str] = None
 
 
-def _ffmpeg_works() -> bool:
-    try:
-        p = subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=FFMPEG_CHECK_TIMEOUT,
-        )
-        return p.returncode == 0
-    except Exception:
-        return False
-
-
-def _safe_cmd_version(cmd: list[str]) -> str:
-    try:
-        p = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=FFMPEG_CHECK_TIMEOUT,
-        )
-        head = (p.stdout or b"").decode(errors="ignore").splitlines()
-        return head[0] if head else ""
-    except Exception as e:
-        return f"{cmd[0]} 执行失败: {e}"
-
-
-def _setup_ffmpeg_fixed() -> None:
-    """
-    强制使用硬编码目录中的 ffmpeg/ffprobe。
-    """
+def _setup_ffmpeg() -> None:
+    """设置 FFmpeg 路径"""
     global FFMPEG_DIR
 
-    dirpath = HARD_CODED_FFMPEG_DIR
-    if not dirpath or not os.path.isdir(dirpath):
-        logger.error(
-            f"[ffmpeg] 硬编码目录不存在：{dirpath}\n"
-            "请确认路径正确，且该目录中包含 ffmpeg.exe 与 ffprobe.exe。"
+    # 硬编码路径
+    hardcoded_path = r"C:\Users\Administrator\Desktop\nonebot\yousa\.venv\ffmpeg\bin"
+
+    if os.path.isdir(hardcoded_path):
+        # 尝试使用硬编码路径
+        ffmpeg_path = os.path.join(
+            hardcoded_path, "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
         )
-        return
-
-    # 预置到 PATH，便于子进程查找
-    os.environ["PATH"] = dirpath + os.pathsep + os.environ.get("PATH", "")
-    ff = shutil.which("ffmpeg")
-    fp = shutil.which("ffprobe")
-
-    if not ff:
-        # 直接按目录拼路径再试一遍
-        ff_candidate = os.path.join(dirpath, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-        if os.path.isfile(ff_candidate):
-            ff = ff_candidate
-        else:
-            logger.error(
-                f"[ffmpeg] 在硬编码目录中未找到 ffmpeg 可执行文件：{dirpath}\n"
-                "请将 ffmpeg.exe 放入该目录。"
+        if os.path.isfile(ffmpeg_path):
+            FFMPEG_DIR = hardcoded_path
+            os.environ["PATH"] = (
+                hardcoded_path + os.pathsep + os.environ.get("PATH", "")
             )
+            logger.info(f"[ffmpeg] 使用硬编码目录: {hardcoded_path}")
             return
 
-    if not fp:
-        fp_candidate = os.path.join(dirpath, "ffprobe.exe" if os.name == "nt" else "ffprobe")
-        if os.path.isfile(fp_candidate):
-            fp = fp_candidate
-        else:
-            logger.warning(f"[ffmpeg] 在目录中未找到 ffprobe，可导致功能受限：{dirpath}")
+    # 回退到系统路径
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        FFMPEG_DIR = os.path.dirname(ffmpeg_path)
+        logger.info(f"[ffmpeg] 使用系统路径: {ffmpeg_path}")
+        return
 
-    FFMPEG_DIR = os.path.dirname(ff)
-    logger.info(f"[ffmpeg] 使用硬编码目录：ffmpeg={ff}；ffprobe={fp or '未找到'}")
-    logger.info(_safe_cmd_version(["ffmpeg", "-version"]))
+    logger.warning("[ffmpeg] 未找到 ffmpeg，请确保已安装并配置正确")
 
 
-_setup_ffmpeg_fixed()
+_setup_ffmpeg()
 
 # 数据目录与持久化
 PLUGIN_NAME = "nonebot_plugin_bili2mp4"
@@ -140,8 +99,8 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # 全局状态
 enabled_groups: Set[int] = set()
 bilibili_cookie: str = ""
-max_height: int = 0           # 0 表示不限制（示例：720/1080/2160）
-max_filesize_mb: int = 0      # 0 表示不限制
+max_height: int = 0  # 0 表示不限制（示例：720/1080/2160）
+max_filesize_mb: int = 0  # 0 表示不限制
 # 简单去重：正在处理中的 key = f"{group_id}|{url}"
 _processing: Set[str] = set()
 
@@ -163,8 +122,8 @@ def _save_state() -> None:
 
 def _load_state() -> None:
     global enabled_groups, bilibili_cookie, max_height, max_filesize_mb
-    if os.path.exists(STATE_PATH):
-        try:
+    try:
+        if os.path.exists(STATE_PATH):
             with open(STATE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             enabled_groups = {int(g) for g in data.get("enabled_groups", [])}
@@ -172,12 +131,13 @@ def _load_state() -> None:
             max_height = int(data.get("max_height", 0) or 0)
             max_filesize_mb = int(data.get("max_filesize_mb", 0) or 0)
             logger.info(
-                f"已加载状态: 启用群数={len(enabled_groups)}，Cookie={bool(bilibili_cookie)}，"
-                f"清晰度<= {max_height or '不限'}，大小<= {str(max_filesize_mb)+'MB' if max_filesize_mb else '不限'}"
+                f"已加载状态: 启用群数={len(enabled_groups)}，Cookie={bool(bilibili_cookie)}"
             )
             return
-        except Exception as e:
-            logger.warning(f"读取状态失败，使用默认空状态: {e}")
+    except Exception as e:
+        logger.warning(f"读取状态失败，使用默认空状态: {e}")
+
+    # 默认值
     enabled_groups = set()
     bilibili_cookie = ""
     max_height = 0
@@ -301,14 +261,14 @@ async def handle_group(bot: Bot, event: Event):
         logger.debug(f"[bili2mp4] 已在处理中，忽略重复: {key}")
         return
     _processing.add(key)
-    logger.info(f"[bili2mp4] 群{group_id} 检测到B站链接：{url}")
+    logger.info(f"[bili2mp4] 检测到B站链接")
 
     async def work():
         try:
             await _download_and_send(bot, group_id, url)
         except Exception as e:
             # 失败时静默（仅日志）
-            logger.error(f"[bili2mp4] 处理失败（静默）：{e}")
+            logger.error(f"[bili2mp4] 处理失败：{e}")
         finally:
             _processing.discard(key)
 
@@ -328,6 +288,126 @@ CMD_SET_HEIGHT_RE = re.compile(r"^设置清晰度\s*(\d+)\s*p?$", flags=re.I)
 CMD_SET_MAXSIZE_RE = re.compile(r"^设置最大大小\s*(\d+)\s*(?:mb|m)?$", flags=re.I)
 
 
+def _get_help_message() -> str:
+    """获取帮助消息"""
+    return (
+        "指令列表：\n"
+        "1) 转换<群号>\n"
+        "2) 停止转换<群号>\n"
+        "3) 设置B站COOKIE <cookie字符串>\n"
+        "4) 清除B站COOKIE\n"
+        "5) 设置清晰度<数字>（如 720/1080，0 代表不限制）\n"
+        "6) 设置最大大小<数字>MB（0 代表不限制）\n"
+        "7) 查看参数 / 查看转换列表"
+    )
+
+
+async def _handle_group_command(
+    bot: Bot, event: PrivateMessageEvent, text: str
+) -> bool:
+    """处理群相关命令"""
+    global enabled_groups
+
+    # 开启群
+    m = CMD_ENABLE_RE.fullmatch(text)
+    if m:
+        gid = int(m.group(1))
+        if gid in enabled_groups:
+            await bot.send(event, Message(f"ℹ️ 群 {gid} 已开启转换"))
+        else:
+            enabled_groups.add(gid)
+            _save_state()
+            await bot.send(event, Message(f"✅ 已开启群 {gid} 的B站视频转换"))
+        return True
+
+    # 关闭群
+    m = CMD_DISABLE_RE.fullmatch(text)
+    if m:
+        gid = int(m.group(1))
+        if gid in enabled_groups:
+            enabled_groups.discard(gid)
+            _save_state()
+            await bot.send(event, Message(f"🛑 已停止群 {gid} 的B站视频转换"))
+        else:
+            await bot.send(event, Message(f"ℹ️ 群 {gid} 未开启转换"))
+        return True
+
+    # 查看列表
+    if text in CMD_LIST:
+        if enabled_groups:
+            sorted_g = sorted(list(enabled_groups))
+            await bot.send(
+                event, Message("当前已开启转换的群：" + ", ".join(map(str, sorted_g)))
+            )
+        else:
+            await bot.send(event, Message("暂无开启转换的群"))
+        return True
+
+    return False
+
+
+async def _handle_config_command(
+    bot: Bot, event: PrivateMessageEvent, text: str
+) -> bool:
+    """处理配置相关命令"""
+    global bilibili_cookie, max_height, max_filesize_mb
+
+    # 设置Cookie
+    m = CMD_SET_COOKIE_RE.fullmatch(text)
+    if m:
+        bilibili_cookie = m.group(1).strip()
+        _save_state()
+        await bot.send(event, Message("✅ 已设置B站 Cookie"))
+        return True
+
+    # 清除Cookie
+    if text in CMD_CLEAR_COOKIE:
+        bilibili_cookie = ""
+        _save_state()
+        await bot.send(event, Message("🧹 已清除B站 Cookie"))
+        return True
+
+    # 设置清晰度（高度）
+    m = CMD_SET_HEIGHT_RE.fullmatch(text)
+    if m:
+        h = int(m.group(1))
+        if h < 0:
+            h = 0
+        max_height = h
+        _save_state()
+        await bot.send(
+            event, Message(f"⏱ 清晰度已设置为 {'不限制' if h == 0 else f'<= {h}p'}")
+        )
+        return True
+
+    # 设置最大大小（MB）
+    m = CMD_SET_MAXSIZE_RE.fullmatch(text)
+    if m:
+        lim = int(m.group(1))
+        if lim < 0:
+            lim = 0
+        max_filesize_mb = lim
+        _save_state()
+        await bot.send(
+            event,
+            Message(f"📦 文件大小限制为 {'不限制' if lim == 0 else f'<= {lim}MB'}"),
+        )
+        return True
+
+    # 查看参数
+    if text in CMD_SHOW_PARAMS:
+        await bot.send(
+            event,
+            Message(
+                f"参数：清晰度<= {max_height or '不限'}；大小<= {str(max_filesize_mb) + 'MB' if max_filesize_mb else '不限'}；"
+                f"Cookie={'已设置' if bool(bilibili_cookie) else '未设置'}；启用群数={len(enabled_groups)}"
+            ),
+        )
+        return True
+
+    return False
+
+
 @ctrl_listener.handle()
 async def handle_private(bot: Bot, event: Event):
     if not isinstance(event, PrivateMessageEvent):
@@ -340,112 +420,21 @@ async def handle_private(bot: Bot, event: Event):
     if uid not in super_admins:
         return
 
-    global bilibili_cookie, max_height, max_filesize_mb
-
-    text = event.get_plaintext().strip()
-
-    # 管理员帮助
-    if text.lower() == "fhelp":
-        help_msg = (
-            "管理员指令：\n"
-            "• fhelp\n"
-            "  返回本帮助列表\n"
-            "• 转换<群号>\n"
-            "  在指定群开启 B 站视频自动转换。例如：转换123456\n"
-            "• 停止转换<群号>\n"
-            "  在指定群关闭自动转换。例如：停止转换123456\n"
-            "• 设置B站COOKIE <cookie内容>\n"
-            "  设置下载用的 B 站 Cookie，例如：设置B站COOKIE SESSDATA=...; bili_jct=...; buvid3=...\n"
-            "• 清除B站COOKIE / 删除B站COOKIE\n"
-            "  清除已设置的 Cookie\n"
-            "• 设置清晰度 <数字> 或 <数字>p\n"
-            "  限制最大分辨率（高度），0 表示不限制。例如：设置清晰度 720 或 1080p\n"
-            "• 设置最大大小 <数字> 或 <数字>MB/m\n"
-            "  限制最终视频大小（MB），0 表示不限制。例如：设置最大大小 45MB\n"
-            "• 查看转换列表 / 查看列表\n"
-            "  查看当前已开启自动转换的群\n"
-            "• 查看参数 / 状态\n"
-            "  查看当前参数（清晰度、大小上限、Cookie 是否设置、启用群数量）"
-        )
-        await bot.send(event, Message(help_msg))
+    text = (event.get_message() or Message()).extract_plain_text().strip()
+    if not text:
         return
 
-    # 开启群
-    m = CMD_ENABLE_RE.fullmatch(text)
-    if m:
-        gid = int(m.group(1))
-        enabled_groups.add(gid)
-        _save_state()
-        await bot.send(event, Message(f"✅ 已开启群 {gid} 的B站视频转换"))
+    # 帮助
+    if text == "fhelp":
+        await bot.send(event, Message(_get_help_message()))
         return
 
-    # 关闭群
-    m = CMD_DISABLE_RE.fullmatch(text)
-    if m:
-        gid = int(m.group(1))
-        if gid in enabled_groups:
-            enabled_groups.discard(gid)
-            _save_state()
-            await bot.send(event, Message(f"🛑 已停止群 {gid} 的B站视频转换"))
-        else:
-            await bot.send(event, Message(f"ℹ️ 群 {gid} 未开启转换"))
+    # 处理群相关命令
+    if await _handle_group_command(bot, event, text):
         return
 
-    # 设置Cookie
-    m = CMD_SET_COOKIE_RE.fullmatch(text)
-    if m:
-        bilibili_cookie = m.group(1).strip()
-        _save_state()
-        await bot.send(event, Message("✅ 已设置B站 Cookie"))
-        return
-
-    # 清除Cookie
-    if text in CMD_CLEAR_COOKIE:
-        bilibili_cookie = ""
-        _save_state()
-        await bot.send(event, Message("🧹 已清除B站 Cookie"))
-        return
-
-    # 设置清晰度（高度）
-    m = CMD_SET_HEIGHT_RE.fullmatch(text)
-    if m:
-        h = int(m.group(1))
-        if h < 0:
-            h = 0
-        max_height = h
-        _save_state()
-        await bot.send(event, Message(f"⏱ 清晰度已设置为 {'不限制' if h == 0 else f'<= {h}p'}"))
-        return
-
-    # 设置最大大小（MB）
-    m = CMD_SET_MAXSIZE_RE.fullmatch(text)
-    if m:
-        lim = int(m.group(1))
-        if lim < 0:
-            lim = 0
-        max_filesize_mb = lim
-        _save_state()
-        await bot.send(event, Message(f"📦 文件大小限制为 {'不限制' if lim == 0 else f'<= {lim}MB'}"))
-        return
-
-    # 查看列表
-    if text in CMD_LIST:
-        if enabled_groups:
-            sorted_g = sorted(list(enabled_groups))
-            await bot.send(event, Message("当前已开启转换的群：" + ", ".join(map(str, sorted_g))))
-        else:
-            await bot.send(event, Message("暂无开启转换的群"))
-        return
-
-    # 查看参数
-    if text in CMD_SHOW_PARAMS:
-        await bot.send(
-            event,
-            Message(
-                f"参数：清晰度<= {max_height or '不限'}；大小<= {str(max_filesize_mb)+'MB' if max_filesize_mb else '不限'}；"
-                f"Cookie={'已设置' if bool(bilibili_cookie) else '未设置'}；启用群数={len(enabled_groups)}"
-            ),
-        )
+    # 处理配置相关命令
+    if await _handle_config_command(bot, event, text):
         return
 
     # 未匹配其他命令
@@ -499,51 +488,50 @@ def _expand_short_url(u: str, timeout: float = 8.0) -> str:
 
 def _ensure_cookiefile(cookie_string: str) -> Optional[str]:
     """
-    将形如 'SESSDATA=...; bili_jct=...; buvid3=...' 的 Cookie 字符串
-    转为 Netscape Cookie File 写入 COOKIE_FILE_PATH，供 yt-dlp 使用。
+    将 Cookie 字符串转为 Netscape 格式，供 yt-dlp 使用。
     """
     cookie_string = (cookie_string or "").strip().strip(";")
     if not cookie_string:
-        # 清除旧文件避免误用
-        try:
-            if os.path.exists(COOKIE_FILE_PATH):
-                os.remove(COOKIE_FILE_PATH)
-        except Exception:
-            pass
-        return None
+        # 清除旧文件
+        if os.path.exists(COOKIE_FILE_PATH):
+            try:
+                if os.path.exists(COOKIE_FILE_PATH):
+                    os.remove(COOKIE_FILE_PATH)
+            except Exception:
+                pass
+            return None
 
-    # 解析键值
-    pairs: list[tuple[str, str]] = []
+    # 解析 Cookie 键值对
+    pairs = []
     for part in cookie_string.split(";"):
         part = part.strip()
-        if not part or "=" not in part:
+        if "=" not in part:
             continue
         k, v = part.split("=", 1)
-        k = k.strip()
-        v = v.strip()
         if k and v:
-            pairs.append((k, v))
+            pairs.append((k.strip(), v.strip()))
+
     if not pairs:
         return None
 
-    # 生成 Netscape 格式
+    # 生成 Netscape 格式 Cookie 文件
     expiry = int(time.time()) + 180 * 24 * 3600  # 180 天
     lines = [
         "# Netscape HTTP Cookie File",
-        "# This file was generated by nonebot_plugin_bili2mp4",
+        "# Generated by nonebot_plugin_bili2mp4",
         "",
     ]
+
     for k, v in pairs:
         # domain include_subdomains path secure expiry name value
-        line = f".bilibili.com\tTRUE\t/\tFALSE\t{expiry}\t{k}\t{v}"
-        lines.append(line)
+        lines.append(f".bilibili.com\tTRUE\t/\tFALSE\t{expiry}\t{k}\t{v}")
 
     try:
         with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+        logger.info(f"Cookie 已设置")
         return COOKIE_FILE_PATH
-    except Exception as e:
-        logger.warning(f"写入 Cookie 文件失败，回退到无 Cookie：{e}")
+    except Exception:
         return None
 
 
@@ -551,40 +539,79 @@ async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
     # 执行下载（阻塞IO放后台线程）
     try:
         path, title = await asyncio.to_thread(
-            _download_with_ytdlp, url, bilibili_cookie, DOWNLOAD_DIR, max_height, max_filesize_mb
+            _download_with_ytdlp,
+            url,
+            bilibili_cookie,
+            DOWNLOAD_DIR,
+            max_height,
+            max_filesize_mb,
         )
-    except ImportError as e:
-        logger.error(f"缺少 yt_dlp 依赖：{e}")
-        return  # 静默
-    except RuntimeError as e:
-        logger.warning(f"下载失败（RuntimeError，静默）：{e}")
-        return  # 静默
+    except (ImportError, RuntimeError):
+        return
     except Exception as e:
-        logger.error(f"下载异常（静默）：{e}")
-        return  # 静默
+        logger.error(f"下载异常：{e}")
+        return
 
-    # 文件大小检查（下载后）
+    # 检查文件大小和分辨率
+    if not _check_video_file(path):
+        return
+
+    # 发送视频
+    await _send_video_with_timeout(bot, group_id, path, title)
+
+
+def _check_video_file(path: str) -> bool:
+    """检查视频文件大小和分辨率"""
     try:
+        # 检查文件大小
         if max_filesize_mb and os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             if size_mb > max_filesize_mb:
-                logger.info(f"视频大小超限：{size_mb:.1f}MB > {max_filesize_mb}MB，取消发送（静默）。")
-                try:
+                if os.path.exists(path):
                     os.remove(path)
-                except Exception:
-                    pass
-                return
-    except Exception as e:
-        logger.debug(f"大小检查异常: {e}")
+                return False
 
-    # 发送视频（若失败保持静默，只记录日志）
+        # 检查视频分辨率
+        if os.path.exists(path):
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0",
+                    path,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                width, height = result.stdout.strip().split(",")
+        return True
+    except Exception:
+        return False
+
+
+async def _send_video_with_timeout(
+    bot: Bot, group_id: int, path: str, title: str
+) -> None:
+    """发送视频，带超时处理"""
     try:
         await bot.send_group_msg(
             group_id=group_id,
-            message=MessageSegment.video(file=path) + Message(f"\n{title or 'B站视频'}"),
+            message=MessageSegment.video(file=path)
+            + Message(f"\n{title or 'B站视频'}"),
         )
+        logger.info("视频已发送到群")
     except Exception as e:
-        logger.error(f"发送视频失败（静默）：{e}")
+        error_msg = str(e)
+        # 完全忽略超时相关的错误
+        if not ("timeout" in error_msg.lower() and "websocket" in error_msg.lower()):
+            logger.error(f"发送视频失败：{e}")
     finally:
         # 清理文件以节省空间
         try:
@@ -595,20 +622,30 @@ async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
 
 
 def _build_format_candidates(height_limit: int, size_limit_mb: int) -> List[str]:
+    """构建格式候选列表"""
     h = height_limit if height_limit and height_limit > 0 else None
-    size = size_limit_mb if size_limit_mb and size_limit_mb > 0 else None
 
-    def h_filter():
-        return f"[height<={h}]" if h else ""
+    if not h:
+        return ["bv*+ba/best"]
 
-    def s_filter():
-        return f"[filesize<={size}M]" if size else ""
+    # 根据清晰度限制构建格式候选
+    format_map = {
+        1080: [
+            f"bv*[height>=1080]+ba/best",
+            f"bv*[height>=720]+ba/best",
+            "bv*+ba/best",
+        ],
+        720: [f"bv*[height>=720]+ba/best", f"bv*[height>=480]+ba/best", "bv*+ba/best"],
+        480: [f"bv*[height>=480]+ba/best", "bv*+ba/best"],
+    }
 
-    # 优先 avc/h264，提高兼容性；再退而求其次
-    v1 = f"bv*{h_filter()}{s_filter()}[vcodec^=avc]+ba/best{h_filter()}{s_filter()}[vcodec^=avc]/best{h_filter()}{s_filter()}"
-    v2 = f"bv*{h_filter()}{s_filter()}+ba/best{h_filter()}{s_filter()}"
-    v3 = f"bv*+ba/best"
-    return [v1, v2, v3]
+    # 根据高度选择最适合的格式列表
+    for threshold, formats in sorted(format_map.items(), reverse=True):
+        if h >= threshold:
+            return formats
+
+    # 默认格式
+    return ["bv*+ba/best"]
 
 
 def _download_with_ytdlp(
@@ -623,53 +660,63 @@ def _download_with_ytdlp(
     # 展开 b23 短链，确保首个请求命中 bilibili.com 域（Cookie 生效）
     final_url = _expand_short_url(url)
 
-    # 生成 Cookie 文件（若配置了 Cookie）
+    # 构建 Cookie 文件（若配置了 Cookie）
     cookiefile = _ensure_cookiefile(cookie)
 
     # 逐个尝试不同的格式表达式（从最严格到最宽松）
     candidates = _build_format_candidates(height_limit, size_limit_mb)
     last_err: Optional[Exception] = None
 
-    for fmt in candidates:
+    for i, fmt in enumerate(candidates):
         headers = _build_browser_like_headers()
         ydl_opts = {
             "format": fmt,
             "outtmpl": os.path.join(out_dir, "%(title).80s [%(id)s].%(ext)s"),
             "noplaylist": True,
             "merge_output_format": "mp4",
-            "quiet": True,
-            "no_warnings": True,
+            "quiet": False,  # 改为False以获取更多调试信息
+            "no_warnings": False,
             "http_headers": headers,
             # 更换客户端有助于过检；失败可回退为 web
             "extractor_args": {
                 "bili": {
-                    "player_client": ["android"],  # 可按需改为 ["android","web"] 轮询
+                    "player_client": ["android", "web"],  # 添加web客户端提高兼容性
                     "lang": ["zh-CN"],
                 }
             },
         }
+
         # 告诉 yt-dlp ffmpeg 在哪里（如果可用）
         if FFMPEG_DIR:
             ydl_opts["ffmpeg_location"] = FFMPEG_DIR
-        # 使用 cookiefile 注入 Cookie，避免通过 Header 传 Cookie 的弃用警告和域不匹配
+
+        # 设置 Cookie
         if cookiefile:
             ydl_opts["cookiefile"] = cookiefile
+            logger.info(f"使用 cookiefile: {cookiefile}")
+        elif cookie:
+            headers["Cookie"] = cookie
+            logger.info("使用 Cookie header")
 
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(final_url, download=True)
                 title = info.get("title") or "B站视频"
+
+                # 获取下载信息
+                height = info.get("height", 0)
+                logger.info(f"下载完成: {title} ({height}p)")
+
+                # 定位文件
                 final_path = _locate_final_file(ydl, info)
                 if not final_path or not os.path.exists(final_path):
                     raise RuntimeError("未找到已下载的视频文件，可能未安装 ffmpeg")
                 return final_path, title
         except DownloadError as e:
             last_err = e
-            logger.debug(f"尝试格式失败（{fmt}）：{e}")
             continue
         except Exception as e:
             last_err = e
-            logger.debug(f"下载异常（{fmt}）：{e}")
             continue
 
     if last_err:
