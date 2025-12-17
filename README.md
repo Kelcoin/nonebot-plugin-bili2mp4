@@ -36,17 +36,16 @@ nonebot-plugin-bili2mp4 是一个用于 NoneBot2 的插件，主要功能包括�
  
 <details open>
 <summary>使用 nb-cli 安装</summary>
-在 nonebot2 项目的根目录下打开命令行，输入以下指令即可安装
-
+在 nonebot2 项目的根目录下打开命令行，输入以下指令
    nb plugin install nonebot-plugin-bili2mp4
-</details>
+
 
 <details open>
 <summary>使用包管理器安装</summary>
 在 nonebot2 项目的插件目录下，打开命令行，根据你使用的包管理器，输入相应的安装命令
-
-**pip:**
-   pip install nonebot-plugin-bili2mp4
+<details open>
+<summary>pip</summary>
+    pip install nonebot-plugin-bili2mp4
 
 打开 nonebot2 项目根目录下的 pyproject.toml 文件, 在 [tool.nonebot] 部分追加写入
 ```bash
