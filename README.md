@@ -35,9 +35,9 @@ nonebot-plugin-bili2mp4 是一个用于 NoneBot2 的插件，主要功能包括�
 ## 💿 安装
  
 <details open>
-    <summary>使用 nb-cli 安装</summary>
-    在 nonebot2 项目的根目录下打开命令行，输入以下指令：
+<summary>使用 nb-cli 安装</summary>
 
+在 nonebot2 项目的根目录下打开命令行，输入以下指令：
 ```bash
 nb plugin install nonebot-plugin-bili2mp4
 ```
@@ -45,6 +45,7 @@ nb plugin install nonebot-plugin-bili2mp4
 
 <details open>
 <summary>使用包管理器安装</summary>
+
 在 nonebot2 项目的根目录下，打开命令行，根据你使用的包管理器，输入相应的安装命令
 <details open>
 <summary>pip</summary>
@@ -58,20 +59,23 @@ pip install nonebot-plugin-bili2mp4
 ```toml
 plugins = ["nonebot_plugin_bili2mp4"]
 ```
-</details>
+</details>s
 
 ## 📦 依赖
 
-- yt-dlp - 
+<details open>
+<summary>yt-dlp</summary>
 
 如果创建项目时使用了虚拟环境请在虚拟环境内安装依赖
 ```bash
 pip install yt-dlp
 ```
-- ffmpeg - 视频格式转换
+</details>
+
+<details open>
+<summary>ffmpeg</summary>
 
 插件依赖FFmpeg进行视频格式转换，需要手动安装：
-
 **Windows:**
 1. 访问 [FFmpeg官网](https://ffmpeg.org/) 下载Windows版本
 2. 解压下载的压缩包到任意目录（如 `C:\ffmpeg`）
@@ -88,7 +92,7 @@ sudo apt install ffmpeg
 ```bash
 brew install ffmpeg
 ```
-
+</details>
 ## ⚙️ 配置
 
 在 nonebot2 项目的`.env`文件中添加下表中的必填配置
