@@ -9,11 +9,14 @@ import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 from typing import List, Optional, Set, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
-from loguru import logger
-from nonebot import on_message
+from nonebot import logger, on_message, require
+
+require("nonebot_plugin_localstore")
+import nonebot_plugin_localstore as store
 from nonebot.adapters.onebot.v11 import (
     Bot,
     Event,
@@ -25,10 +28,6 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.plugin import get_plugin_config
 
 from .config import Config
-
-# 可调的 ffmpeg 检测超时（秒），如遇到 Windows 首次运行较慢，可在启动前设置：
-# PowerShell: $env:BILI2MP4_FFMPEG_TIMEOUT="30"
-FFMPEG_CHECK_TIMEOUT = int(os.getenv("BILI2MP4_FFMPEG_TIMEOUT", "30"))
 
 # 配置加载
 plugin_config = get_plugin_config(Config)
@@ -42,66 +41,28 @@ FFMPEG_DIR: Optional[str] = None
 def _setup_ffmpeg() -> None:
     """设置 FFmpeg 路径"""
     global FFMPEG_DIR
-
-    # 硬编码路径
-    hardcoded_path = r"C:\Users\Administrator\Desktop\nonebot\yousa\.venv\ffmpeg\bin"
-
-    if os.path.isdir(hardcoded_path):
-        # 尝试使用硬编码路径
-        ffmpeg_path = os.path.join(
-            hardcoded_path, "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-        )
-        if os.path.isfile(ffmpeg_path):
-            FFMPEG_DIR = hardcoded_path
-            os.environ["PATH"] = (
-                hardcoded_path + os.pathsep + os.environ.get("PATH", "")
-            )
-            logger.info(f"[ffmpeg] 使用硬编码目录: {hardcoded_path}")
-            return
-
-    # 回退到系统路径
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
         FFMPEG_DIR = os.path.dirname(ffmpeg_path)
         logger.info(f"[ffmpeg] 使用系统路径: {ffmpeg_path}")
         return
-
     logger.warning("[ffmpeg] 未找到 ffmpeg，请确保已安装并配置正确")
 
 
 _setup_ffmpeg()
 
-# 数据目录与持久化
 PLUGIN_NAME = "nonebot_plugin_bili2mp4"
+DATA_DIR = store.get_plugin_data_dir()
+STATE_PATH = store.get_plugin_data_file("state.json")
+DOWNLOAD_DIR = store.get_plugin_data_dir() / "downloads"
+COOKIE_FILE_PATH = store.get_plugin_data_file("bili_cookies.txt")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
-def _get_data_dir() -> str:
-    try:
-        from nonebot_plugin_localstore import get_plugin_data_dir  # type: ignore
-
-        path = str(get_plugin_data_dir())
-        os.makedirs(path, exist_ok=True)
-        logger.debug(f"使用 nonebot-plugin-localstore 数据目录: {path}")
-        return path
-    except Exception:
-        base = os.path.join(os.getcwd(), "data", PLUGIN_NAME)
-        os.makedirs(base, exist_ok=True)
-        logger.debug(f"使用回退数据目录: {base}")
-        return base
-
-
-DATA_DIR = _get_data_dir()
-STATE_PATH = os.path.join(DATA_DIR, "state.json")
-DOWNLOAD_DIR = os.path.join(DATA_DIR, "downloads")
-COOKIE_FILE_PATH = os.path.join(DATA_DIR, "bili_cookies.txt")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# 全局状态
 enabled_groups: Set[int] = set()
 bilibili_cookie: str = ""
 max_height: int = 0  # 0 表示不限制（示例：720/1080/2160）
 max_filesize_mb: int = 0  # 0 表示不限制
-# 简单去重：正在处理中的 key = f"{group_id}|{url}"
 _processing: Set[str] = set()
 
 
@@ -113,7 +74,7 @@ def _save_state() -> None:
             "max_height": int(max_height),
             "max_filesize_mb": int(max_filesize_mb),
         }
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
+        with STATE_PATH.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         logger.debug(f"状态已保存: {STATE_PATH}")
     except Exception as e:
@@ -123,8 +84,8 @@ def _save_state() -> None:
 def _load_state() -> None:
     global enabled_groups, bilibili_cookie, max_height, max_filesize_mb
     try:
-        if os.path.exists(STATE_PATH):
-            with open(STATE_PATH, "r", encoding="utf-8") as f:
+        if STATE_PATH.exists():
+            with STATE_PATH.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             enabled_groups = {int(g) for g in data.get("enabled_groups", [])}
             bilibili_cookie = str(data.get("bilibili_cookie", "") or "")
@@ -147,7 +108,7 @@ def _load_state() -> None:
 
 _load_state()
 
-# 更宽松的域名匹配（含 m.bilibili.com、t.bilibili.com 等）
+# 域名匹配（含 m.bilibili.com、t.bilibili.com 等）
 BILI_URL_RE = re.compile(
     r"(https?://(?:[\w-]+\.)?(?:bilibili\.com|b23\.tv)/[^\s\"'<>]+)",
     flags=re.IGNORECASE,
@@ -237,7 +198,7 @@ def _extract_bili_urls_from_event(event: GroupMessageEvent) -> List[str]:
     return urls
 
 
-# 群消息监听（只在启用群里生效）
+# 群消息监听
 group_listener = on_message(priority=100, block=False)
 
 
@@ -275,7 +236,7 @@ async def handle_group(bot: Bot, event: Event):
     asyncio.create_task(work())
 
 
-# 私聊控制（超级管理员）
+# 私聊控制
 ctrl_listener = on_message(priority=50, block=False)
 
 CMD_ENABLE_RE = re.compile(r"^转换\s*(\d+)$", flags=re.IGNORECASE)
@@ -349,7 +310,7 @@ async def _handle_config_command(
         await bot.send(event, Message("🧹 已清除B站 Cookie"))
         return True
 
-    # 设置清晰度（高度）
+    # 设置清晰度
     m = CMD_SET_HEIGHT_RE.fullmatch(text)
     if m:
         h = int(m.group(1))
@@ -475,10 +436,10 @@ def _ensure_cookiefile(cookie_string: str) -> Optional[str]:
     cookie_string = (cookie_string or "").strip().strip(";")
     if not cookie_string:
         # 清除旧文件
-        if os.path.exists(COOKIE_FILE_PATH):
+        if COOKIE_FILE_PATH.exists():
             try:
-                if os.path.exists(COOKIE_FILE_PATH):
-                    os.remove(COOKIE_FILE_PATH)
+                if COOKIE_FILE_PATH.exists():
+                    COOKIE_FILE_PATH.unlink()
             except Exception:
                 pass
             return None
@@ -509,16 +470,16 @@ def _ensure_cookiefile(cookie_string: str) -> Optional[str]:
         lines.append(f".bilibili.com\tTRUE\t/\tFALSE\t{expiry}\t{k}\t{v}")
 
     try:
-        with open(COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
+        with COOKIE_FILE_PATH.open("w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         logger.info(f"Cookie 已设置")
-        return COOKIE_FILE_PATH
+        return str(COOKIE_FILE_PATH)
     except Exception:
         return None
 
 
 async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
-    # 执行下载（阻塞IO放后台线程）
+    # 执行下载
     try:
         path, title = await asyncio.to_thread(
             _download_with_ytdlp,
@@ -546,15 +507,16 @@ def _check_video_file(path: str) -> bool:
     """检查视频文件大小和分辨率"""
     try:
         # 检查文件大小
-        if max_filesize_mb and os.path.exists(path):
-            size_mb = os.path.getsize(path) / (1024 * 1024)
+        path_obj = Path(path)
+        if max_filesize_mb and path_obj.exists():
+            size_mb = path_obj.stat().st_size / (1024 * 1024)
             if size_mb > max_filesize_mb:
-                if os.path.exists(path):
-                    os.remove(path)
+                if path_obj.exists():
+                    path_obj.unlink()
                 return False
 
         # 检查视频分辨率
-        if os.path.exists(path):
+        if path_obj.exists():
             result = subprocess.run(
                 [
                     "ffprobe",
@@ -591,14 +553,14 @@ async def _send_video_with_timeout(
         logger.info("视频已发送到群")
     except Exception as e:
         error_msg = str(e)
-        # 完全忽略超时相关的错误
         if not ("timeout" in error_msg.lower() and "websocket" in error_msg.lower()):
             logger.error(f"发送视频失败：{e}")
     finally:
-        # 清理文件以节省空间
+        # 清理文件
         try:
-            if os.path.exists(path):
-                os.remove(path)
+            path_obj = Path(path)
+            if path_obj.exists():
+                path_obj.unlink()
         except Exception:
             pass
 
@@ -639,13 +601,11 @@ def _download_with_ytdlp(
     except Exception:
         raise ImportError("yt_dlp not installed")
 
-    # 展开 b23 短链，确保首个请求命中 bilibili.com 域（Cookie 生效）
+    # 展开 b23 短链，确保首个请求命中 bilibili.com 域
     final_url = _expand_short_url(url)
 
-    # 构建 Cookie 文件（若配置了 Cookie）
+    # 构建 Cookie 文件
     cookiefile = _ensure_cookiefile(cookie)
-
-    # 逐个尝试不同的格式表达式（从最严格到最宽松）
     candidates = _build_format_candidates(height_limit, size_limit_mb)
     last_err: Optional[Exception] = None
 
@@ -653,7 +613,7 @@ def _download_with_ytdlp(
         headers = _build_browser_like_headers()
         ydl_opts = {
             "format": fmt,
-            "outtmpl": os.path.join(out_dir, "%(title).80s [%(id)s].%(ext)s"),
+            "outtmpl": str(out_dir / "%(title).80s [%(id)s].%(ext)s"),
             "noplaylist": True,
             "merge_output_format": "mp4",
             "quiet": False,  # 改为False以获取更多调试信息
@@ -668,7 +628,7 @@ def _download_with_ytdlp(
             },
         }
 
-        # 告诉 yt-dlp ffmpeg 在哪里（如果可用）
+        # 告诉 yt-dlp ffmpeg 在哪里
         if FFMPEG_DIR:
             ydl_opts["ffmpeg_location"] = FFMPEG_DIR
 
@@ -691,7 +651,7 @@ def _download_with_ytdlp(
 
                 # 定位文件
                 final_path = _locate_final_file(ydl, info)
-                if not final_path or not os.path.exists(final_path):
+                if not final_path or not Path(final_path).exists():
                     raise RuntimeError("未找到已下载的视频文件，可能未安装 ffmpeg")
                 return final_path, title
         except DownloadError as e:
@@ -731,10 +691,10 @@ def _locate_final_file(ydl, info) -> Optional[str]:
     if vid:
         dirpath = os.path.dirname(base) or os.getcwd()
         try:
-            files = [os.path.join(dirpath, f) for f in os.listdir(dirpath) if vid in f]
+            files = [dirpath / f for f in os.listdir(dirpath) if vid in f]
             if files:
-                files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-                return files[0]
+                files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                return str(files[0])
         except Exception:
             pass
     return None
