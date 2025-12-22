@@ -131,8 +131,12 @@ dmypy.json
 # NoneBot specific
 bot.py
 .env.*
-config.py
-config.*.py
+/config.py
+/config.*.py
+
+# 保留插件内的配置文件
+!nonebot_plugin_bili2mp4/config.py
+!nonebot_plugin_bili2mp4/config.*.py
 
 # Plugin specific
 data/
