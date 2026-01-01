@@ -80,8 +80,10 @@ pip install yt-dlp
 **Windows:**
 1. 访问 [FFmpeg官网](https://ffmpeg.org/) 下载Windows版本
 2. 解压下载的压缩包到任意目录（如 `C:\ffmpeg`）
+（若不加到PATH中，需要在`.env`中指定路径，参考配置中的`ffmpeg_path`)
 3. 将 `ffmpeg.exe` 所在目录添加到系统环境变量PATH中
 4. 在命令行中运行 `ffmpeg -version` 验证安装是否成功
+可参考教程 `https://www.jianshu.com/p/5015a477de3c`
 
 **Linux :**
 ```bash
@@ -93,6 +95,17 @@ sudo apt install ffmpeg
 ```bash
 brew install ffmpeg
 ```
+若不加到PATH中，需要在`.env`中指定路径，比如：
+
+**Windows:**
+```prod
+ffmpeg_path = "C:/ffmpeg/bin"
+```
+**Linux / macOS:**
+```prod
+ffmpeg_path = "/usr/local/bin"
+```
+
 </details>
 
 ## ⚙️ 配置
@@ -102,7 +115,7 @@ brew install ffmpeg
 | 配置项 | 必填 | 默认值 | 说明 |
 |:-----:|:----:|:----:|:----:|
 | super_admins | 是 | [] | 管理员QQ号列表 |
-
+| ffmpeg_path | 否 | [] | FFmpeg的路径，如果为空则自动从PATH中查找 |
 
 ## 🎉 使用
 
@@ -122,9 +135,10 @@ brew install ffmpeg
 **注**：
 以上指令均需管理员私聊bot
 
-Cookie可以不设置，设置大会员账号的cookie可以获取更高清晰度或者大会员限定视频
+Cookie为必需，至少需要包含SESSDATA、bili_jct、DedeUserID和buvid3/buvid4四个字段
 
-Cookie中至少需要包含SESSDATA、bili_jct、DedeUserID和buvid3/buvid4四个字段
+设置大会员账号的cookie可以获取更高清晰度或者大会员限定视频
+
 ## 效果图
 <img src="nonebot_plugin_bili2mp4/images/picture1.png" width="500">
 <img src="nonebot_plugin_bili2mp4/images/picture2.png" width="500">
