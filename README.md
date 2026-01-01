@@ -140,5 +140,5 @@ Cookie为必需，至少需要包含SESSDATA、bili_jct、DedeUserID和buvid3/bu
 设置大会员账号的cookie可以获取更高清晰度或者大会员限定视频
 
 ## 效果图
-<img src="nonebot_plugin_bili2mp4/images/picture1.png" width="500">
-<img src="nonebot_plugin_bili2mp4/images/picture2.png" width="500">
+<img src="images/picture1.png" width="500">
+<img src="images/picture2.png" width="500">
