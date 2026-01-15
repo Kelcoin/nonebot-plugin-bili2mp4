@@ -38,7 +38,7 @@ enabled_groups: Set[int] = set()
 bilibili_cookie: str = ""
 max_height: int = 0
 max_filesize_mb: int = 0
-super_admins: List[int] = []
+bili_super_admins: List[int] = []
 
 _processing: Set[str] = set()
 
@@ -68,17 +68,17 @@ BILI_URL_RE = re.compile(
 
 def _init_plugin():
     global DATA_DIR, STATE_PATH, DOWNLOAD_DIR, COOKIE_FILE_PATH
-    global super_admins, FFMPEG_DIR
+    global bili_super_admins, FFMPEG_DIR
 
     if DATA_DIR is not None:
         return
 
     # 读取插件配置
     plugin_config = get_plugin_config(Config)
-    super_admins = plugin_config.super_admins or []
+    bili_super_admins = plugin_config.bili_super_admins or []
 
     # 获取数据目录
-    DATA_DIR = store.get_plugin_data_dir(versioned=False)
+    DATA_DIR = store.get_plugin_data_dir()
     STATE_PATH = DATA_DIR / "state.json"
     COOKIE_FILE_PATH = DATA_DIR / "bili_cookies.txt"
     DOWNLOAD_DIR = DATA_DIR / "downloads"
@@ -110,7 +110,7 @@ def _init_plugin():
             logger.info("bili2mp4: 未找到ffmpeg")
             FFMPEG_DIR = None
 
-    logger.info(f"bili2mp4: 初始化完成，超管={super_admins}")
+    logger.info(f"bili2mp4: 初始化完成，超管={bili_super_admins}")
 
 
 # =========================
@@ -748,7 +748,7 @@ async def handle_private(bot: Bot, event: Event):
         uid = int(event.user_id)
     except Exception:
         return
-    if uid not in super_admins:
+    if uid not in bili_super_admins:
         return
 
     text = (event.get_message() or Message()).extract_plain_text().strip()
