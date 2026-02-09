@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import asyncio
 import json
 import os
@@ -394,30 +395,45 @@ def _check_video_file(path: str) -> bool:
 async def _send_video_with_timeout(
     bot: Bot, group_id: int, path: str, title: str
 ) -> None:
-    """发送视频，带超时处理"""
+    """发送视频（先转为 base64），发送后删除本地文件"""
     sent = False
+    path_obj = Path(path)
+
     try:
+        if not path_obj.exists():
+            logger.warning(f"bili2mp4: 待发送文件不存在: {path}")
+            return
+
+        # 读取文件并转为 base64
+        with path_obj.open("rb") as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode("ascii")
+        file_field = f"base64://{b64}"
+
+        # 通过 base64 发送视频
         await bot.send_group_msg(
             group_id=group_id,
-            message=MessageSegment.video(file=path)
+            message=MessageSegment.video(file=file_field)
             + Message(f"\n{title or 'B站视频'}"),
         )
-        logger.info(f"bili2mp4: 视频已发送到群 {group_id}: {title or 'B站视频'}")
+        logger.info(
+            f"bili2mp4: 通过 base64 发送视频到群 {group_id}: {title or 'B站视频'}"
+        )
         sent = True
+
     except Exception as e:
         error_msg = str(e)
         if not ("timeout" in error_msg.lower() and "websocket" in error_msg.lower()):
             logger.warning(
-                f"bili2mp4: 发送视频失败: {Path(path).name} | group={group_id} | err={e}"
+                f"bili2mp4: 发送 base64 视频失败: {path_obj.name} | group={group_id} | err={e}"
             )
     finally:
-        if sent:
-            try:
-                path_obj = Path(path)
-                if path_obj.exists():
-                    path_obj.unlink()
-            except Exception as e:
-                logger.debug(f"Failed to delete temp file {path}: {e}")
+        try:
+            if path_obj.exists():
+                path_obj.unlink()
+                logger.debug(f"bili2mp4: 已删除临时文件 {path}")
+        except Exception as e:
+            logger.debug(f"bili2mp4: 删除临时文件失败 {path}: {e}")
 
 
 def _build_format_candidates(height_limit: int, size_limit_mb: int) -> List[str]:
