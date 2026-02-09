@@ -39,6 +39,7 @@ enabled_groups: Set[int] = set()
 bilibili_cookie: str = ""
 max_height: int = 0
 max_filesize_mb: int = 0
+max_duration_sec: int = 0
 bili_super_admins: List[int] = []
 
 _processing: Set[str] = set()
@@ -54,6 +55,7 @@ CMD_SET_COOKIE_RE = re.compile(r"^设置B站COOKIE\s+(.+)$", flags=re.S)
 CMD_CLEAR_COOKIE = {"清除B站COOKIE", "删除B站COOKIE"}
 CMD_SET_HEIGHT_RE = re.compile(r"^设置清晰度\s*(\d+)$", flags=re.IGNORECASE)
 CMD_SET_MAXSIZE_RE = re.compile(r"^设置最大大小\s*(\d+)\s*MB$", flags=re.IGNORECASE)
+CMD_SET_MAXDUR_RE = re.compile(r"^设置最大时长\s*(\d+)\s*S$", flags=re.IGNORECASE)
 CMD_SHOW_PARAMS = {"查看参数", "参数", "设置"}
 
 # 域名匹配
@@ -127,13 +129,14 @@ def _save_state():
         "bilibili_cookie": bilibili_cookie,
         "max_height": max_height,
         "max_filesize_mb": max_filesize_mb,
+        "max_duration_sec": max_duration_sec,
     }
     with STATE_PATH.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 def _load_state():
-    global enabled_groups, bilibili_cookie, max_height, max_filesize_mb
+    global enabled_groups, bilibili_cookie, max_height, max_filesize_mb, max_duration_sec
 
     if not STATE_PATH or not STATE_PATH.exists():
         return
@@ -145,6 +148,7 @@ def _load_state():
         bilibili_cookie = data.get("bilibili_cookie", "")
         max_height = int(data.get("max_height", 0))
         max_filesize_mb = int(data.get("max_filesize_mb", 0))
+        max_duration_sec = int(data.get("max_duration_sec", 0))
     except Exception as e:
         logger.warning(f"bili2mp4: 状态加载失败: {e}")
 
@@ -160,6 +164,7 @@ def _get_help_message() -> str:
         "• 清除B站COOKIE - 清除已设置的B站Cookie\n"
         "• 设置清晰度 <数字> - 设置视频清晰度限制（如 720/1080，0 代表不限制）\n"
         "• 设置最大大小 <数字>MB - 设置视频大小限制（0 代表不限制）\n"
+        "• 设置最大时长 <数字>S - 设置视频最大时长（秒，0 代表不限制）\n"
         "• 查看参数 - 查看当前配置参数\n"
         "• 查看转换列表 - 查看已开启转换功能的群列表\n\n"
         "Cookie中至少需要包含SESSDATA、bili_jct、DedeUserID和buvid3/buvid4四个字段"
@@ -186,6 +191,26 @@ def _find_urls_in_text(text: str) -> List[str]:
     return urls
 
 
+def _extract_bvid_from_url(url: str) -> Optional[str]:
+    """从 B 站链接中提取 BV 号"""
+    try:
+        parsed = urlparse(url)
+        # 1) 先看 query 里有没有 bvid
+        qs = parse_qs(parsed.query)
+        bvid_list = qs.get("bvid") or qs.get("bvids")
+        if bvid_list:
+            return bvid_list[0]
+
+        # 2) 再从 path 中匹配 /video/BVxxxx
+        m = re.search(r"/video/(BV[0-9A-Za-z]+)", parsed.path)
+        if m:
+            return m.group(1)
+
+        return None
+    except Exception:
+        return None
+
+
 def _walk_strings(obj) -> List[str]:
     out: List[str] = []
     try:
@@ -205,6 +230,7 @@ def _walk_strings(obj) -> List[str]:
 def _extract_bili_urls_from_event(event: GroupMessageEvent) -> List[str]:
     urls: List[str] = []
     try:
+        # 遍历消息段
         for seg in event.message:
             # 1) 纯文本
             if seg.type == "text":
@@ -212,6 +238,7 @@ def _extract_bili_urls_from_event(event: GroupMessageEvent) -> List[str]:
                 for u in _find_urls_in_text(txt):
                     if u not in urls:
                         urls.append(u)
+
             # 2) JSON 卡片
             elif seg.type == "json":
                 raw = seg.data.get("data") or seg.data.get("content") or ""
@@ -226,26 +253,119 @@ def _extract_bili_urls_from_event(event: GroupMessageEvent) -> List[str]:
                                 urls.append(u)
                 except Exception:
                     pass
+
             # 3) XML 卡片
             elif seg.type == "xml":
                 raw = seg.data.get("data") or seg.data.get("content") or ""
                 for u in _find_urls_in_text(raw):
                     if u not in urls:
                         urls.append(u)
+
             # 4) 分享卡片
             elif seg.type == "share":
                 u = seg.data.get("url") or ""
                 for u2 in _find_urls_in_text(u):
                     if u2 not in urls:
                         urls.append(u2)
+
+            # 5) 其他消息段
             else:
                 s = str(seg)
                 for u in _find_urls_in_text(s):
                     if u not in urls:
                         urls.append(u)
+
+        try:
+            full_text = event.get_plaintext()
+        except Exception:
+            full_text = ""
+
+        # 匹配 av123456（不匹配纯数字）
+        for m in re.findall(r"(?i)\bav(\d+)\b", full_text):
+            av_str = f"av{m}"
+            if av_str not in urls:
+                urls.append(av_str)
+
+        # 匹配 AV 链接（如 /video/av123456/）
+        for m in re.findall(r"https?://[^\s\"'<>]*/video/av(\d+)", full_text, flags=re.IGNORECASE):
+            av_url = f"https://www.bilibili.com/video/av{m}/"
+            if av_url not in urls:
+                urls.append(av_url)
+
     except Exception as e:
         logger.debug(f"bili2mp4: 提取链接异常: {e}")
+
     return urls
+
+
+def _extract_aid_from_url(url: str) -> Optional[int]:
+    """从 B 站链接中提取 AV 号"""
+    try:
+        parsed = urlparse(url)
+        # /video/av123456
+        m = re.search(r"/video/av(\d+)", parsed.path, flags=re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+
+        # query 中的 aid / avid
+        qs = parse_qs(parsed.query)
+        for key in ("aid", "avid"):
+            vals = qs.get(key)
+            if vals:
+                num_m = re.search(r"(\d+)", vals[0])
+                if num_m:
+                    return int(num_m.group(1))
+
+        return None
+    except Exception:
+        return None
+
+
+def _bili_av_to_bv(aid: int) -> Optional[str]:
+    """将 AV 号转换为 BV 号"""
+    try:
+        table = "fZodR9XQDSUm21yCkr6zBqiveYah8bt4xsWpHnJE7jL5VG3guMTKNPAwcF"
+        s = [11, 10, 3, 8, 4, 6]
+        xor = 177451812
+        add = 8728348608
+
+        x = (aid ^ xor) + add
+        r = list("BV1  4 1 7  ")
+        for i in range(6):
+            r[s[i]] = table[x // 58**i % 58]
+        return "".join(r)
+    except Exception:
+        return None
+
+
+def _normalize_bili_url(raw: str) -> str:
+    u = (raw or "").strip()
+
+    # 1) av123456 / AV123456 这种纯 AV 前缀形式
+    m = re.fullmatch(r"(?i)av(\d+)", u)
+    if m:
+        aid = int(m.group(1))
+        bv = _bili_av_to_bv(aid)
+        if bv:
+            return f"https://www.bilibili.com/video/{bv}"
+        return raw
+
+    # 2) 非 URL，且不是 av 前缀形式，直接返回（不再把纯数字当 AV 号）
+    if not u.lower().startswith(("http://", "https://")):
+        return raw
+
+    # 3) 先展开 b23.tv 短链
+    u2 = _expand_short_url(u)
+
+    # 4) 如果是 AV 链接，转为 BV 链接
+    aid = _extract_aid_from_url(u2)
+    if aid is not None:
+        bv = _bili_av_to_bv(aid)
+        if bv:
+            return f"https://www.bilibili.com/video/{bv}"
+
+    # 5) 其他情况（BV 链接等）直接返回展开后的 URL
+    return u2
 
 
 def _build_browser_like_headers() -> dict:
@@ -387,6 +507,40 @@ def _check_video_file(path: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _get_bili_duration_seconds(url: str) -> Optional[int]:
+    """
+    通过 B 站开放接口获取视频时长（秒）
+    - 支持 BV 链接 / AV 链接 / b23.tv（已在外部规范化）
+    """
+    try:
+        norm = _normalize_bili_url(url)
+        bvid = _extract_bvid_from_url(norm)
+        if not bvid:
+            return None
+
+        api_url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+        req = urllib.request.Request(
+            api_url,
+            headers=_build_browser_like_headers(),
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+        data = json.loads(raw)
+
+        if data.get("code") != 0:
+            return None
+
+        d = data.get("data") or {}
+        dur = d.get("duration")
+        if isinstance(dur, int):
+            return dur
+        return None
+    except Exception as e:
+        logger.debug(f"bili2mp4: 获取视频时长失败: {e}")
+        return None
 
 
 async def _send_video_with_timeout(
@@ -591,13 +745,33 @@ def _locate_final_file(ydl, info) -> Optional[str]:
 
 
 async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
-    # 执行下载
+    # 规范化链接
+    norm_url = _normalize_bili_url(url)
+
+    # 如果设置了最大时长，通过 API 检查
+    try:
+        if max_duration_sec and max_duration_sec > 0:
+            dur = _get_bili_duration_seconds(norm_url)
+            if dur is not None:
+                if dur > max_duration_sec:
+                    logger.info(
+                        f"bili2mp4: 视频时长 {dur}s 超过最大限制 {max_duration_sec}s，跳过下载"
+                    )
+                    return
+                else:
+                    logger.info(
+                        f"bili2mp4: 视频时长 {dur}s 在限制 {max_duration_sec}s 内，继续下载"
+                    )
+    except Exception as e:
+        logger.debug(f"bili2mp4: 最大时长预检查失败，忽略并继续下载: {e}")
+
+    # 执行下载（内部仍会再次处理短链，但已是标准 BV 链接）
     try:
         path, title = await asyncio.to_thread(
             _download_with_ytdlp,
-            url,
+            norm_url,
             bilibili_cookie,
-            DOWNLOAD_DIR,  # 修复：传递Path对象而不是字符串
+            DOWNLOAD_DIR,  # 传递 Path 对象
             max_height,
             max_filesize_mb,
         )
@@ -664,7 +838,7 @@ async def _handle_config_command(
     bot: Bot, event: PrivateMessageEvent, text: str
 ) -> bool:
     """处理配置相关命令"""
-    global bilibili_cookie, max_height, max_filesize_mb
+    global bilibili_cookie, max_height, max_filesize_mb, max_duration_sec
 
     # 设置Cookie
     m = CMD_SET_COOKIE_RE.fullmatch(text)
@@ -708,12 +882,30 @@ async def _handle_config_command(
         )
         return True
 
+    # 设置最大时长（秒）
+    m = CMD_SET_MAXDUR_RE.fullmatch(text)
+    if m:
+        d = int(m.group(1))
+        if d < 0:
+            d = 0
+        max_duration_sec = d
+        _save_state()
+        await bot.send(
+            event,
+            Message(
+                f"⏱ 最大时长已设置为 {'不限制' if d == 0 else f'<= {d} 秒'}"
+            ),
+        )
+        return True
+
     # 查看参数
     if text in CMD_SHOW_PARAMS:
         await bot.send(
             event,
             Message(
-                f"参数：清晰度<= {max_height or '不限'}；大小<= {str(max_filesize_mb) + 'MB' if max_filesize_mb else '不限'}；"
+                f"参数：清晰度<= {max_height or '不限'}；"
+                f"大小<= {str(max_filesize_mb) + 'MB' if max_filesize_mb else '不限'}；"
+                f"最大时长<= {str(max_duration_sec) + '秒' if max_duration_sec else '不限'}；"
                 f"Cookie={'已设置' if bool(bilibili_cookie) else '未设置'}；启用群数={len(enabled_groups)}"
             ),
         )
