@@ -341,52 +341,49 @@ def _ensure_cookiefile(cookie_string: str) -> Optional[str]:
 
 
 def _check_video_file(path: str) -> bool:
-    """检查视频文件大小和分辨率"""
+    """检查视频分辨率（大小限制在 _download_with_ytdlp 中处理）"""
     try:
-        # 检查文件大小
         path_obj = Path(path)
-        if max_filesize_mb and path_obj.exists():
-            size_mb = path_obj.stat().st_size / (1024 * 1024)
-            if size_mb > max_filesize_mb:
-                if path_obj.exists():
-                    path_obj.unlink()
-                return False
+
+        # 如果文件不存在，直接失败
+        if not path_obj.exists():
+            return False
 
         # 检查视频分辨率
-        if path_obj.exists():
-            ffprobe_exe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
-            cmd = [ffprobe_exe]
-            if FFMPEG_DIR:
-                cmd[0] = str(Path(FFMPEG_DIR) / ffprobe_exe)
+        ffprobe_exe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        cmd = [ffprobe_exe]
+        if FFMPEG_DIR:
+            cmd[0] = str(Path(FFMPEG_DIR) / ffprobe_exe)
 
-            cmd.extend(
-                [
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=width,height",
-                    "-of",
-                    "csv=p=0",
-                    path,
-                ]
-            )
+        cmd.extend(
+            [
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                path,
+            ]
+        )
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                try:
-                    width, height = result.stdout.strip().split(",")
-                    # 检查是否设置了高度限制
-                    if max_height and int(height) > max_height:
-                        path_obj.unlink()
-                        return False
-                except ValueError:
-                    pass
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            try:
+                width, height = result.stdout.strip().split(",")
+                # 检查是否设置了高度限制
+                if max_height and int(height) > max_height:
+                    path_obj.unlink()
+                    return False
+            except ValueError:
+                pass
+
         return True
     except Exception:
         return False
@@ -526,7 +523,28 @@ def _download_with_ytdlp(
                 final_path = _locate_final_file(ydl, info)
                 if not final_path or not Path(final_path).exists():
                     raise RuntimeError("未找到已下载的视频文件，可能未安装 ffmpeg")
+
+                # 按最大大小限制检查，如果超限则删除并尝试下一档清晰度
+                if size_limit_mb and Path(final_path).exists():
+                    size_mb = Path(final_path).stat().st_size / (1024 * 1024)
+                    if size_mb > size_limit_mb:
+                        logger.info(
+                            f"bili2mp4: 下载完成但超过大小限制 "
+                            f"{size_mb:.2f}MB > {size_limit_mb}MB，尝试更低清晰度"
+                        )
+                        try:
+                            Path(final_path).unlink()
+                        except Exception as e:
+                            logger.debug(
+                                f"bili2mp4: 删除超限文件失败 {final_path}: {e}"
+                            )
+                        last_err = RuntimeError("文件超过大小限制")
+                        # 不返回，继续尝试下一种格式
+                        continue
+
+                # 未超大小限制，返回该文件
                 return final_path, title
+
         except DownloadError as e:
             last_err = e
             continue
@@ -534,6 +552,7 @@ def _download_with_ytdlp(
             last_err = e
             continue
 
+    # 所有候选格式都失败或都超限
     if last_err:
         raise RuntimeError(str(last_err))
     raise RuntimeError("无法下载该视频")
