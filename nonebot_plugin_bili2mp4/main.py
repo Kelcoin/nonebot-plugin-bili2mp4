@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import asyncio
 import json
 import os
@@ -10,7 +9,7 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Dict
 from urllib.parse import parse_qs, unquote, urlparse
 
 from nonebot import logger, on_message, require
@@ -42,11 +41,12 @@ max_filesize_mb: int = 0
 max_duration_sec: int = 0
 bili_super_admins: List[int] = []
 
+# 映射路径 -> 真实路径 映射，例如 "/bilivideo" -> "C:\\...\\downloads"
+path_mappings: Dict[str, str] = {}
+
 _processing: Set[str] = set()
 
-
 FFMPEG_DIR: Optional[str] = None
-
 
 CMD_LIST = {"查看转换列表", "查看列表", "转换列表"}
 CMD_ENABLE_RE = re.compile(r"^转换\s*(\d+)$", flags=re.IGNORECASE)
@@ -58,11 +58,17 @@ CMD_SET_MAXSIZE_RE = re.compile(r"^设置最大大小\s*(\d+)\s*MB$", flags=re.I
 CMD_SET_MAXDUR_RE = re.compile(r"^设置最大时长\s*(\d+)\s*S$", flags=re.IGNORECASE)
 CMD_SHOW_PARAMS = {"查看参数", "参数", "设置"}
 
+# 映射命令
+CMD_SET_MAPPING_RE = re.compile(r"^映射路径\s+(\S+)\s+(.+)$", flags=re.IGNORECASE)
+CMD_REMOVE_MAPPING_RE = re.compile(r"^删除映射\s+(\S+)$", flags=re.IGNORECASE)
+CMD_LIST_MAPPINGS = {"查看映射", "映射列表"}
+
 # 域名匹配
 BILI_URL_RE = re.compile(
     r"(https?://(?:[\w-]+\.)?(?:bilibili\.com|b23\.tv)/[^\s\"'<>]+)",
     flags=re.IGNORECASE,
 )
+
 
 # =========================
 # 初始化函数
@@ -71,7 +77,7 @@ BILI_URL_RE = re.compile(
 
 def _init_plugin():
     global DATA_DIR, STATE_PATH, DOWNLOAD_DIR, COOKIE_FILE_PATH
-    global bili_super_admins, FFMPEG_DIR
+    global bili_super_admins, FFMPEG_DIR, path_mappings
 
     if DATA_DIR is not None:
         return
@@ -85,7 +91,7 @@ def _init_plugin():
     STATE_PATH = DATA_DIR / "state.json"
     COOKIE_FILE_PATH = DATA_DIR / "bili_cookies.txt"
     DOWNLOAD_DIR = DATA_DIR / "downloads"
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"bili2mp4: DATA_DIR={DATA_DIR} STATE_PATH={STATE_PATH}")
 
@@ -130,13 +136,17 @@ def _save_state():
         "max_height": max_height,
         "max_filesize_mb": max_filesize_mb,
         "max_duration_sec": max_duration_sec,
+        "path_mappings": path_mappings,
     }
-    with STATE_PATH.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with STATE_PATH.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception(f"bili2mp4: 保存状态失败: {e}")
 
 
 def _load_state():
-    global enabled_groups, bilibili_cookie, max_height, max_filesize_mb, max_duration_sec
+    global enabled_groups, bilibili_cookie, max_height, max_filesize_mb, max_duration_sec, path_mappings
 
     if not STATE_PATH or not STATE_PATH.exists():
         return
@@ -149,6 +159,7 @@ def _load_state():
         max_height = int(data.get("max_height", 0))
         max_filesize_mb = int(data.get("max_filesize_mb", 0))
         max_duration_sec = int(data.get("max_duration_sec", 0))
+        path_mappings = data.get("path_mappings", {}) or {}
     except Exception as e:
         logger.warning(f"bili2mp4: 状态加载失败: {e}")
 
@@ -166,7 +177,10 @@ def _get_help_message() -> str:
         "• 设置最大大小 <数字>MB - 设置视频大小限制（0 代表不限制）\n"
         "• 设置最大时长 <数字>S - 设置视频最大时长（秒，0 代表不限制）\n"
         "• 查看参数 - 查看当前配置参数\n"
-        "• 查看转换列表 - 查看已开启转换功能的群列表\n\n"
+        "• 查看转换列表 - 查看已开启转换功能的群列表\n"
+        "• 映射路径 <映射路径> <真实路径> - 将服务器真实路径映射为映射路径（例如 /bilivideo）\n"
+        "• 删除映射 <映射路径> - 删除已设置的映射\n"
+        "• 查看映射 - 列出当前映射\n\n"
         "Cookie中至少需要包含SESSDATA、bili_jct、DedeUserID和buvid3/buvid4四个字段"
     )
 
@@ -350,7 +364,7 @@ def _normalize_bili_url(raw: str) -> str:
             return f"https://www.bilibili.com/video/{bv}"
         return raw
 
-    # 2) 非 URL，且不是 av 前缀形式，直接返回（不再把纯数字当 AV 号）
+    # 2) 非 URL，且不是 av 前缀形式，直接返回
     if not u.lower().startswith(("http://", "https://")):
         return raw
 
@@ -422,8 +436,7 @@ def _ensure_cookiefile(cookie_string: str) -> Optional[str]:
     if not cookie_string:
         if COOKIE_FILE_PATH.exists():
             try:
-                if COOKIE_FILE_PATH.exists():
-                    COOKIE_FILE_PATH.unlink()
+                COOKIE_FILE_PATH.unlink()
             except Exception:
                 pass
         return None
@@ -499,7 +512,7 @@ def _check_video_file(path: str) -> bool:
                 width, height = result.stdout.strip().split(",")
                 # 检查是否设置了高度限制
                 if max_height and int(height) > max_height:
-                    path_obj.unlink()
+                    path_obj.unlink(missing_ok=True)
                     return False
             except ValueError:
                 pass
@@ -512,7 +525,6 @@ def _check_video_file(path: str) -> bool:
 def _get_bili_duration_seconds(url: str) -> Optional[int]:
     """
     通过 B 站开放接口获取视频时长（秒）
-    - 支持 BV 链接 / AV 链接 / b23.tv（已在外部规范化）
     """
     try:
         norm = _normalize_bili_url(url)
@@ -546,8 +558,6 @@ def _get_bili_duration_seconds(url: str) -> Optional[int]:
 async def _send_video_with_timeout(
     bot: Bot, group_id: int, path: str, title: str
 ) -> None:
-    """发送视频（先转为 base64），发送后删除本地文件"""
-    sent = False
     path_obj = Path(path)
 
     try:
@@ -555,161 +565,40 @@ async def _send_video_with_timeout(
             logger.warning(f"bili2mp4: 待发送文件不存在: {path}")
             return
 
-        # 读取文件并转为 base64
-        with path_obj.open("rb") as f:
-            data = f.read()
-        b64 = base64.b64encode(data).decode("ascii")
-        file_field = f"base64://{b64}"
+        # 如果存在映射，使用映射后的虚拟路径发送
+        send_path = str(path_obj)
+        for virt, real in path_mappings.items():
+            try:
+                real_p = str(Path(real).resolve())
+                p_resolved = str(path_obj.resolve())
+                if p_resolved.startswith(real_p):
+                    # 构造虚拟路径：映射路径 + 相对路径
+                    rel = p_resolved[len(real_p):].replace("\\", "/")
+                    if not rel.startswith("/"):
+                        rel = "/" + rel
+                    send_path = virt.rstrip("/") + rel
+                    logger.debug(f"bili2mp4: 使用映射发送路径 {send_path} (real={p_resolved})")
+                    break
+            except Exception:
+                continue
 
-        # 通过 base64 发送视频
+        # 通过文件路径发送视频
         await bot.send_group_msg(
             group_id=group_id,
-            message=MessageSegment.video(file=file_field)
+            message=MessageSegment.video(file=send_path)
             + Message(f"\n{title or 'B站视频'}"),
         )
-        logger.info(
-            f"bili2mp4: 通过 base64 发送视频到群 {group_id}: {title or 'B站视频'}"
-        )
-        sent = True
+        logger.info(f"bili2mp4: 发送视频到群 {group_id}: {title or 'B站视频'}")
 
     except Exception as e:
-        error_msg = str(e)
-        if not ("timeout" in error_msg.lower() and "websocket" in error_msg.lower()):
-            logger.warning(
-                f"bili2mp4: 发送 base64 视频失败: {path_obj.name} | group={group_id} | err={e}"
-            )
+        logger.warning(f"bili2mp4: 发送视频失败: {e}")
     finally:
         try:
             if path_obj.exists():
-                path_obj.unlink()
+                path_obj.unlink(missing_ok=True)
                 logger.debug(f"bili2mp4: 已删除临时文件 {path}")
         except Exception as e:
             logger.debug(f"bili2mp4: 删除临时文件失败 {path}: {e}")
-
-
-def _build_format_candidates(height_limit: int, size_limit_mb: int) -> List[str]:
-    """构建格式候选列表"""
-    h = height_limit if height_limit and height_limit > 0 else None
-
-    if not h:
-        return ["bv*+ba/best"]
-
-    # 根据清晰度限制构建格式候选
-    format_map = {
-        1080: [
-            f"bv*[height>=1080]+ba/best",
-            f"bv*[height>=720]+ba/best",
-            "bv*+ba/best",
-        ],
-        720: [f"bv*[height>=720]+ba/best", f"bv*[height>=480]+ba/best", "bv*+ba/best"],
-        480: [f"bv*[height>=480]+ba/best", "bv*+ba/best"],
-    }
-
-    # 根据高度选择最适合的格式列表
-    for threshold, formats in sorted(format_map.items(), reverse=True):
-        if h >= threshold:
-            return formats
-
-    # 默认格式
-    return ["bv*+ba/best"]
-
-
-def _download_with_ytdlp(
-    url: str, cookie: str, out_dir, height_limit: int, size_limit_mb: int
-) -> Tuple[str, str]:
-    try:
-        from yt_dlp import YoutubeDL  # type: ignore
-        from yt_dlp.utils import DownloadError  # type: ignore
-    except Exception:
-        raise ImportError("yt_dlp not installed")
-
-    from pathlib import Path
-
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    final_url = _expand_short_url(url)
-
-    # 构建 Cookie 文件
-    cookiefile = _ensure_cookiefile(cookie)
-    candidates = _build_format_candidates(height_limit, size_limit_mb)
-    last_err: Optional[Exception] = None
-
-    for i, fmt in enumerate(candidates):
-        headers = _build_browser_like_headers()
-        ydl_opts = {
-            "format": fmt,
-            "outtmpl": str(out_dir / "%(title).80s [%(id)s].%(ext)s"),
-            "noplaylist": True,
-            "merge_output_format": "mp4",
-            "quiet": False,
-            "no_warnings": False,
-            "http_headers": headers,
-            "extractor_args": {
-                "bili": {
-                    "player_client": ["android", "web"],
-                    "lang": ["zh-CN"],
-                }
-            },
-        }
-
-        if FFMPEG_DIR:
-            ydl_opts["ffmpeg_location"] = FFMPEG_DIR
-
-        # 设置 Cookie
-        if cookiefile:
-            ydl_opts["cookiefile"] = cookiefile
-            logger.info(f"bili2mp4: 使用 cookiefile: {cookiefile}")
-        elif cookie:
-            headers["Cookie"] = cookie
-            logger.info("bili2mp4: 使用 Cookie header")
-
-        try:
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(final_url, download=True)
-                title = info.get("title") or "B站视频"
-
-                # 获取下载信息
-                height = info.get("height", 0)
-                logger.info(f"bili2mp4: 下载完成: {title} ({height}p)")
-
-                # 定位文件
-                final_path = _locate_final_file(ydl, info)
-                if not final_path or not Path(final_path).exists():
-                    raise RuntimeError("未找到已下载的视频文件，可能未安装 ffmpeg")
-
-                # 按最大大小限制检查，如果超限则删除并尝试下一档清晰度
-                if size_limit_mb and Path(final_path).exists():
-                    size_mb = Path(final_path).stat().st_size / (1024 * 1024)
-                    if size_mb > size_limit_mb:
-                        logger.info(
-                            f"bili2mp4: 下载完成但超过大小限制 "
-                            f"{size_mb:.2f}MB > {size_limit_mb}MB，尝试更低清晰度"
-                        )
-                        try:
-                            Path(final_path).unlink()
-                        except Exception as e:
-                            logger.debug(
-                                f"bili2mp4: 删除超限文件失败 {final_path}: {e}"
-                            )
-                        last_err = RuntimeError("文件超过大小限制")
-                        # 不返回，继续尝试下一种格式
-                        continue
-
-                # 未超大小限制，返回该文件
-                return final_path, title
-
-        except DownloadError as e:
-            last_err = e
-            continue
-        except Exception as e:
-            last_err = e
-            continue
-
-    # 所有候选格式都失败或都超限
-    if last_err:
-        raise RuntimeError(str(last_err))
-    raise RuntimeError("无法下载该视频")
 
 
 def _locate_final_file(ydl, info) -> Optional[str]:
@@ -735,13 +624,146 @@ def _locate_final_file(ydl, info) -> Optional[str]:
     if vid:
         dirpath = os.path.dirname(base) or os.getcwd()
         try:
-            files = [dirpath / f for f in os.listdir(dirpath) if vid in f]
+            files = [Path(dirpath) / f for f in os.listdir(dirpath) if vid in f]
             if files:
                 files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
                 return str(files[0])
         except Exception:
             pass
     return None
+
+
+def _download_with_ytdlp(
+    url: str, cookie: str, out_dir, height_limit: int, size_limit_mb: int
+) -> Tuple[str, str]:
+    try:
+        from yt_dlp import YoutubeDL  # type: ignore
+        from yt_dlp.utils import DownloadError  # type: ignore
+    except Exception:
+        raise ImportError("yt_dlp not installed")
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    final_url = _expand_short_url(url)
+    cookiefile = _ensure_cookiefile(cookie)
+
+    headers = _build_browser_like_headers()
+    base_opts = {
+        "outtmpl": str(out_dir / "%(title).80s [%(id)s].%(ext)s"),
+        "noplaylist": True,
+        "merge_output_format": "mp4",
+        "quiet": False,
+        "no_warnings": False,
+        "http_headers": headers,
+        "extractor_args": {"bili": {"player_client": ["android", "web"], "lang": ["zh-CN"]}},
+    }
+    if FFMPEG_DIR:
+        base_opts["ffmpeg_location"] = FFMPEG_DIR
+    if cookiefile:
+        base_opts["cookiefile"] = cookiefile
+        logger.info(f"bili2mp4: 使用 cookiefile: {cookiefile}")
+    elif cookie:
+        headers["Cookie"] = cookie
+        logger.info("bili2mp4: 使用 Cookie header")
+
+    # 1) 先获取所有可用格式（不下载）
+    try:
+        with YoutubeDL(base_opts) as ydl:
+            info = ydl.extract_info(final_url, download=False)
+            title = info.get("title") or "B站视频"
+            formats = info.get("formats", []) or []
+            # 过滤掉仅音频或无视频的格式
+            formats = [f for f in formats if f.get("vcodec") != "none"]
+            # 按高度和码率排序，从高到低
+            formats.sort(key=lambda f: ((f.get("height") or 0), (f.get("tbr") or 0)), reverse=True)
+    except Exception as e:
+        raise RuntimeError(f"获取视频格式信息失败: {e}")
+
+    last_err: Optional[Exception] = None
+
+    # 2) 逐个预检 formats（使用 metadata 判断大小与高度），只对通过预检的格式进行下载
+    for fmt in formats:
+        fmt_id = fmt.get("format_id")
+        h = fmt.get("height") or 0
+
+        # 跳过超过高度限制的格式
+        if height_limit and h and h > height_limit:
+            logger.debug(f"bili2mp4: 预检跳过格式 {fmt_id}，高度 {h} 超过限制 {height_limit}")
+            continue
+
+        # 使用格式元数据判断文件大小（优先 filesize_approx，再 filesize）
+        filesize_bytes = None
+        if fmt.get("filesize_approx"):
+            try:
+                filesize_bytes = int(fmt.get("filesize_approx"))
+            except Exception:
+                filesize_bytes = None
+        if filesize_bytes is None and fmt.get("filesize"):
+            try:
+                filesize_bytes = int(fmt.get("filesize"))
+            except Exception:
+                filesize_bytes = None
+
+        if size_limit_mb and filesize_bytes is not None:
+            size_mb_est = filesize_bytes / (1024 * 1024)
+            if size_mb_est > size_limit_mb:
+                logger.info(
+                    f"bili2mp4: 预检跳过格式 {fmt_id}，估算大小 {size_mb_est:.2f}MB 超过限制 {size_limit_mb}MB"
+                )
+                continue
+
+        # 如果没有 filesize 信息但用户设置了大小限制，仍可尝试，但记录为不确定
+        logger.info(f"bili2mp4: 预检通过，准备下载格式 {fmt_id} 高度={h} 估算大小={'未知' if filesize_bytes is None else f'{filesize_bytes/(1024*1024):.2f}MB'}")
+
+        # 构造下载选项，仅下载该 format_id
+        opts = dict(base_opts)
+        opts["format"] = fmt_id
+
+        try:
+            with YoutubeDL(opts) as ydl:
+                info2 = ydl.extract_info(final_url, download=True)
+                final_path = _locate_final_file(ydl, info2)
+                if not final_path or not Path(final_path).exists():
+                    logger.debug(f"bili2mp4: 未找到下载后的文件，格式 {fmt_id}")
+                    last_err = RuntimeError("下载后未找到文件")
+                    # 尝试下一个候选
+                    continue
+
+                # 如果下载后仍有 size_limit_mb，二次确认
+                if size_limit_mb:
+                    try:
+                        size_mb = Path(final_path).stat().st_size / (1024 * 1024)
+                        if size_mb > size_limit_mb:
+                            logger.info(
+                                f"bili2mp4: 下载后文件 {final_path} 大小 {size_mb:.2f}MB 超过限制 {size_limit_mb}MB，删除并尝试更低清晰度"
+                            )
+                            try:
+                                Path(final_path).unlink(missing_ok=True)
+                            except Exception as e:
+                                logger.debug(f"bili2mp4: 删除超限文件失败 {final_path}: {e}")
+                            last_err = RuntimeError("文件超过大小限制")
+                            continue
+                    except Exception:
+                        # 无法读取文件大小时，仍当作成功处理（但记录日志）
+                        logger.debug(f"bili2mp4: 无法读取已下载文件大小以确认限制: {final_path}")
+
+                # 成功且未超限
+                return final_path, title
+
+        except DownloadError as e:
+            last_err = e
+            logger.warning(f"bili2mp4: 格式 {fmt_id} 下载失败: {e}")
+            continue
+        except Exception as e:
+            last_err = e
+            logger.warning(f"bili2mp4: 格式 {fmt_id} 异常: {e}")
+            continue
+
+    # 所有候选格式都失败或都超限
+    if last_err:
+        raise RuntimeError(str(last_err))
+    raise RuntimeError("无法下载该视频（所有候选格式均不满足条件或下载失败）")
 
 
 async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
@@ -771,7 +793,7 @@ async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
             _download_with_ytdlp,
             norm_url,
             bilibili_cookie,
-            DOWNLOAD_DIR,  # 传递 Path 对象
+            DOWNLOAD_DIR,
             max_height,
             max_filesize_mb,
         )
@@ -784,9 +806,10 @@ async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
 
     # 检查文件大小和分辨率
     if not _check_video_file(path):
+        logger.info(f"bili2mp4: 文件 {path} 未通过分辨率检查或已被删除")
         return
 
-    # 发送视频
+    # 发送视频（使用文件路径）
     await _send_video_with_timeout(bot, group_id, path, title)
 
 
@@ -838,7 +861,7 @@ async def _handle_config_command(
     bot: Bot, event: PrivateMessageEvent, text: str
 ) -> bool:
     """处理配置相关命令"""
-    global bilibili_cookie, max_height, max_filesize_mb, max_duration_sec
+    global bilibili_cookie, max_height, max_filesize_mb, max_duration_sec, path_mappings
 
     # 设置Cookie
     m = CMD_SET_COOKIE_RE.fullmatch(text)
@@ -911,89 +934,140 @@ async def _handle_config_command(
         )
         return True
 
+    # 设置映射
+    m = CMD_SET_MAPPING_RE.fullmatch(text)
+    if m:
+        virt = m.group(1).strip()
+        real = m.group(2).strip()
+        # 支持带引号路径
+        if (real.startswith('"') and real.endswith('"')) or (real.startswith("'") and real.endswith("'")):
+            real = real[1:-1].strip()
+        # 规范化
+        if not virt.startswith("/"):
+            virt = "/" + virt
+        try:
+            real_p = str(Path(real).resolve())
+        except Exception as e:
+            logger.warning(f"bili2mp4: 映射路径解析失败 raw={real} err={e}")
+            await bot.send(event, Message(f"❌ 路径解析失败: {e}"))
+            return True
+
+        # 可选：检查路径是否存在（这里提示并仍允许保存）
+        if not Path(real_p).exists():
+            await bot.send(event, Message(f"⚠️ 目标路径不存在: {real_p}，请确认路径或创建后重试"))
+            # 仍然保存映射以便管理员后续修正；如需强制存在可改为 return True
+            # return True
+
+        path_mappings[virt] = real_p
+        _save_state()
+        logger.info(f"bili2mp4: 已添加映射 {real_p} -> {virt}")
+        await bot.send(event, Message(f"✅ 已映射 {real_p} -> {virt}"))
+        return True
+
+    # 删除映射
+    m = CMD_REMOVE_MAPPING_RE.fullmatch(text)
+    if m:
+        virt = m.group(1).strip()
+        if not virt.startswith("/"):
+            virt = "/" + virt
+        if virt in path_mappings:
+            path_mappings.pop(virt, None)
+            _save_state()
+            await bot.send(event, Message(f"🗑 已删除映射 {virt}"))
+        else:
+            await bot.send(event, Message(f"ℹ️ 未找到映射 {virt}"))
+        return True
+
+    # 查看映射
+    if text in CMD_LIST_MAPPINGS:
+        if path_mappings:
+            lines = [f"{virt} -> {real}" for virt, real in path_mappings.items()]
+            await bot.send(event, Message("当前映射：\n" + "\n".join(lines)))
+        else:
+            await bot.send(event, Message("暂无映射"))
+        return True
+
     return False
 
 
 # =========================
-# 事件监听
+# 消息处理器注册
 # =========================
 
-# 群消息监听
-group_listener = on_message(priority=100, block=False)
+
+try:
+    _init_plugin()
+except Exception as e:
+    logger.exception(f"bili2mp4: 初始化失败: {e}")
 
 
-@group_listener.handle()
-async def handle_group(bot: Bot, event: Event):
+matcher = on_message(priority=5)
+
+@matcher.handle()
+async def _bili2mp4_message_handler(bot: Bot, event: Event):
     try:
         _init_plugin()
 
-        if not isinstance(event, GroupMessageEvent):
-            return
-
-        group_id = int(event.group_id)
-        if group_id not in enabled_groups:
-            return
-
-        urls = _extract_bili_urls_from_event(event)
-        if not urls:
-            logger.debug(f"bili2mp4: 群{group_id} 未在该消息中发现B站链接")
-            return
-
-        url = urls[0]
-        key = f"{group_id}|{url}"
-        if key in _processing:
-            logger.debug(f"bili2mp4: 已在处理中，忽略重复: {key}")
-            return
-        _processing.add(key)
-        logger.info(f"bili2mp4: 检测到B站链接")
-
-        async def work():
+        # 私聊命令处理
+        if isinstance(event, PrivateMessageEvent):
             try:
-                await _download_and_send(bot, group_id, url)
-            except Exception as e:
-                logger.warning(f"bili2mp4: 处理失败: {e}")
-            finally:
-                _processing.discard(key)
+                text = event.get_plaintext().strip()
+            except Exception:
+                text = str(event.message)
 
-        asyncio.create_task(work())
+            logger.debug(f"bili2mp4: 收到私聊消息 from={getattr(event, 'user_id', 'unknown')} text={text}")
+
+            try:
+                sender = int(getattr(event, "user_id", 0))
+            except Exception:
+                sender = 0
+
+            # 仅超管可执行配置命令（按需调整）
+            if sender in (bili_super_admins or []):
+                handled = await _handle_group_command(bot, event, text)
+                if handled:
+                    return
+                handled = await _handle_config_command(bot, event, text)
+                if handled:
+                    return
+                # 未匹配任何命令，忽略或回复帮助
+                logger.debug(f"bili2mp4: 私聊命令未匹配 text={text}")
+                return
+            else:
+                logger.debug(f"bili2mp4: 非超管尝试执行命令 user={sender} text={text}")
+                return
+
+        # 群消息处理：提取 B 站链接并触发下载
+        if isinstance(event, GroupMessageEvent):
+            try:
+                group_id = int(getattr(event, "group_id", 0))
+            except Exception:
+                group_id = 0
+
+            # 只在已启用的群处理
+            if group_id not in enabled_groups:
+                return
+
+            urls = _extract_bili_urls_from_event(event)
+            if not urls:
+                return
+
+            # 去重并异步下载发送
+            for u in urls:
+                if u in _processing:
+                    logger.debug(f"bili2mp4: 链接已在处理队列 {u}")
+                    continue
+                _processing.add(u)
+
+                async def _task_wrapper(bot: Bot, group_id: int, u: str):
+                    try:
+                        await _download_and_send(bot, group_id, u)
+                    finally:
+                        try:
+                            _processing.discard(u)
+                        except Exception:
+                            pass
+
+                asyncio.create_task(_task_wrapper(bot, group_id, u))
     except Exception as e:
-        logger.warning(f"bili2mp4: 群消息处理异常: {e}")
-
-
-# 私聊控制
-ctrl_listener = on_message(priority=50, block=False)
-
-
-@ctrl_listener.handle()
-async def handle_private(bot: Bot, event: Event):
-    _init_plugin()
-
-    if not isinstance(event, PrivateMessageEvent):
-        return
-
-    try:
-        uid = int(event.user_id)
-    except Exception:
-        return
-    if uid not in bili_super_admins:
-        return
-
-    text = (event.get_message() or Message()).extract_plain_text().strip()
-    if not text:
-        return
-
-    try:
-        # 帮助
-        if text == "fhelp":
-            await bot.send(event, Message(_get_help_message()))
-            return
-
-        if await _handle_group_command(bot, event, text):
-            return
-
-        if await _handle_config_command(bot, event, text):
-            return
-    except Exception as e:
-        logger.warning(f"bili2mp4: 处理管理员命令失败: {e}")
-
-    return
+        logger.exception(f"bili2mp4: 消息处理器异常: {e}")
