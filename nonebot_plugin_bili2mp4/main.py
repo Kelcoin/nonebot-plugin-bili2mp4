@@ -667,77 +667,90 @@ def _download_with_ytdlp(
         headers["Cookie"] = cookie
         logger.info("bili2mp4: 使用 Cookie header")
 
-    # 1) 先获取所有可用格式（不下载）
+    def _estimate_size_bytes(fmt: dict) -> Optional[int]:
+        v = fmt.get("filesize_approx") or fmt.get("filesize")
+        try:
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
     try:
         with YoutubeDL(base_opts) as ydl:
             info = ydl.extract_info(final_url, download=False)
             title = info.get("title") or "B站视频"
             formats = info.get("formats", []) or []
-            # 过滤掉仅音频或无视频的格式
-            formats = [f for f in formats if f.get("vcodec") != "none"]
-            # 按高度和码率排序，从高到低
-            formats.sort(key=lambda f: ((f.get("height") or 0), (f.get("tbr") or 0)), reverse=True)
     except Exception as e:
         raise RuntimeError(f"获取视频格式信息失败: {e}")
 
-    last_err: Optional[Exception] = None
+    video_only = [f for f in formats if f.get("vcodec") and f.get("vcodec") != "none" and (not f.get("acodec") or f.get("acodec") == "none")]
+    audio_only = [f for f in formats if f.get("acodec") and f.get("acodec") != "none" and (not f.get("vcodec") or f.get("vcodec") == "none")]
 
-    # 2) 逐个预检 formats（使用 metadata 判断大小与高度），只对通过预检的格式进行下载
-    for fmt in formats:
-        fmt_id = fmt.get("format_id")
-        h = fmt.get("height") or 0
+    if not video_only or not audio_only:
+        raise RuntimeError("未找到可用的 video-only 或 audio-only 格式")
 
-        # 跳过超过高度限制的格式
-        if height_limit and h and h > height_limit:
-            logger.debug(f"bili2mp4: 预检跳过格式 {fmt_id}，高度 {h} 超过限制 {height_limit}")
+    def _video_key(f):
+        return ((f.get("height") or 0), (f.get("tbr") or 0))
+
+    video_only.sort(key=_video_key, reverse=True)
+    audio_only.sort(key=lambda f: (f.get("abr") or 0, f.get("tbr") or 0), reverse=True)
+
+    candidates: List[Tuple[str, dict, dict, Optional[int]]] = []
+    for vfmt in video_only:
+        vh = vfmt.get("height") or 0
+        if height_limit and vh and vh > height_limit:
+            logger.debug(f"bili2mp4: 跳过 video-only 格式 {vfmt.get('format_id')}，高度 {vh} 超过限制 {height_limit}")
             continue
 
-        # 使用格式元数据判断文件大小（优先 filesize_approx，再 filesize）
-        filesize_bytes = None
-        if fmt.get("filesize_approx"):
-            try:
-                filesize_bytes = int(fmt.get("filesize_approx"))
-            except Exception:
-                filesize_bytes = None
-        if filesize_bytes is None and fmt.get("filesize"):
-            try:
-                filesize_bytes = int(fmt.get("filesize"))
-            except Exception:
-                filesize_bytes = None
+        for afmt in audio_only:
+            # estimate combined size if possible
+            v_size = _estimate_size_bytes(vfmt)
+            a_size = _estimate_size_bytes(afmt)
+            est_sum = None
+            if v_size is not None or a_size is not None:
+                est_sum = (v_size or 0) + (a_size or 0)
 
-        if size_limit_mb and filesize_bytes is not None:
-            size_mb_est = filesize_bytes / (1024 * 1024)
-            if size_mb_est > size_limit_mb:
-                logger.info(
-                    f"bili2mp4: 预检跳过格式 {fmt_id}，估算大小 {size_mb_est:.2f}MB 超过限制 {size_limit_mb}MB"
-                )
-                continue
+            if size_limit_mb and est_sum is not None:
+                if est_sum / (1024 * 1024) > size_limit_mb:
+                    logger.info(
+                        f"bili2mp4: 预检跳过组合 {vfmt.get('format_id')}+{afmt.get('format_id')}，估算大小 {est_sum/(1024*1024):.2f}MB 超过限制 {size_limit_mb}MB"
+                    )
+                    # try next audio (smaller abr) for same video
+                    continue
 
-        # 如果没有 filesize 信息但用户设置了大小限制，仍可尝试，但记录为不确定
-        logger.info(f"bili2mp4: 预检通过，准备下载格式 {fmt_id} 高度={h} 估算大小={'未知' if filesize_bytes is None else f'{filesize_bytes/(1024*1024):.2f}MB'}")
+            fmt_expr = f"{vfmt.get('format_id')}+{afmt.get('format_id')}"
+            candidates.append((fmt_expr, vfmt, afmt, est_sum))
+            break
 
-        # 构造下载选项，仅下载该 format_id
+    if not candidates:
+        logger.info("bili2mp4: 预检未找到合适组合，放宽大小限制并尝试最高质量组合")
+        # take top video and top audio
+        vfmt = video_only[0]
+        afmt = audio_only[0]
+        fmt_expr = f"{vfmt.get('format_id')}+{afmt.get('format_id')}"
+        candidates.append((fmt_expr, vfmt, afmt, None))
+
+    last_err: Optional[Exception] = None
+
+    for fmt_expr, vfmt, afmt, est_sum in candidates:
+        logger.info(f"bili2mp4: 尝试下载组合 {fmt_expr} 估算大小={'未知' if est_sum is None else f'{est_sum/(1024*1024):.2f}MB'}")
         opts = dict(base_opts)
-        opts["format"] = fmt_id
+        opts["format"] = fmt_expr
 
         try:
             with YoutubeDL(opts) as ydl:
                 info2 = ydl.extract_info(final_url, download=True)
+                title2 = info2.get("title") or title
                 final_path = _locate_final_file(ydl, info2)
                 if not final_path or not Path(final_path).exists():
-                    logger.debug(f"bili2mp4: 未找到下载后的文件，格式 {fmt_id}")
+                    logger.debug(f"bili2mp4: 下载后未找到文件，组合 {fmt_expr}")
                     last_err = RuntimeError("下载后未找到文件")
-                    # 尝试下一个候选
                     continue
 
-                # 如果下载后仍有 size_limit_mb，二次确认
                 if size_limit_mb:
                     try:
                         size_mb = Path(final_path).stat().st_size / (1024 * 1024)
                         if size_mb > size_limit_mb:
-                            logger.info(
-                                f"bili2mp4: 下载后文件 {final_path} 大小 {size_mb:.2f}MB 超过限制 {size_limit_mb}MB，删除并尝试更低清晰度"
-                            )
+                            logger.info(f"bili2mp4: 下载后文件 {final_path} 大小 {size_mb:.2f}MB 超过限制 {size_limit_mb}MB，删除并尝试下一个候选")
                             try:
                                 Path(final_path).unlink(missing_ok=True)
                             except Exception as e:
@@ -745,25 +758,55 @@ def _download_with_ytdlp(
                             last_err = RuntimeError("文件超过大小限制")
                             continue
                     except Exception:
-                        # 无法读取文件大小时，仍当作成功处理（但记录日志）
                         logger.debug(f"bili2mp4: 无法读取已下载文件大小以确认限制: {final_path}")
 
-                # 成功且未超限
-                return final_path, title
+                try:
+                    ffprobe_exe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+                    cmd = [ffprobe_exe]
+                    if FFMPEG_DIR:
+                        cmd[0] = str(Path(FFMPEG_DIR) / ffprobe_exe)
+                    cmd.extend(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", final_path])
+                    res = subprocess.run(cmd, capture_output=True, text=True)
+                    has_audio = bool(res.stdout.strip())
+                except Exception:
+                    has_audio = False
+                    try:
+                        if info2.get("acodec") and info2.get("acodec") != "none":
+                            has_audio = True
+                        else:
+                            # 检查 requested_formats 中是否有 audio part
+                            reqs = info2.get("requested_formats") or info2.get("requested_downloads") or []
+                            for it in reqs:
+                                if it.get("acodec") and it.get("acodec") != "none":
+                                    has_audio = True
+                                    break
+                    except Exception:
+                        has_audio = True  # 保守假定有音频
+
+                if not has_audio:
+                    logger.warning(f"bili2mp4: 已下载文件 {final_path} 未检测到音频流，删除并尝试下一个候选")
+                    try:
+                        Path(final_path).unlink(missing_ok=True)
+                    except Exception as e:
+                        logger.debug(f"bili2mp4: 删除无音频文件失败 {final_path}: {e}")
+                    last_err = RuntimeError("下载文件无音频")
+                    continue
+
+                logger.info(f"bili2mp4: 下载并通过检查: {final_path}")
+                return final_path, title2
 
         except DownloadError as e:
             last_err = e
-            logger.warning(f"bili2mp4: 格式 {fmt_id} 下载失败: {e}")
+            logger.warning(f"bili2mp4: 组合 {fmt_expr} 下载失败: {e}")
             continue
         except Exception as e:
             last_err = e
-            logger.warning(f"bili2mp4: 格式 {fmt_id} 异常: {e}")
+            logger.warning(f"bili2mp4: 组合 {fmt_expr} 异常: {e}")
             continue
 
-    # 所有候选格式都失败或都超限
     if last_err:
         raise RuntimeError(str(last_err))
-    raise RuntimeError("无法下载该视频（所有候选格式均不满足条件或下载失败）")
+    raise RuntimeError("无法下载该视频（所有候选组合均不满足条件或下载失败）")
 
 
 async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
@@ -787,7 +830,7 @@ async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
     except Exception as e:
         logger.debug(f"bili2mp4: 最大时长预检查失败，忽略并继续下载: {e}")
 
-    # 执行下载（内部仍会再次处理短链，但已是标准 BV 链接）
+    # 执行下载
     try:
         path, title = await asyncio.to_thread(
             _download_with_ytdlp,
@@ -809,7 +852,7 @@ async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
         logger.info(f"bili2mp4: 文件 {path} 未通过分辨率检查或已被删除")
         return
 
-    # 发送视频（使用文件路径）
+    # 发送视频
     await _send_video_with_timeout(bot, group_id, path, title)
 
 
