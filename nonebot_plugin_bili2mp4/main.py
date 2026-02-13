@@ -9,7 +9,7 @@ import subprocess
 import time
 import urllib.request
 from pathlib import Path
-from typing import List, Optional, Set, Tuple, Dict
+from typing import List, Optional, Set, Tuple, Dict, Union
 from urllib.parse import parse_qs, unquote, urlparse
 
 from nonebot import logger, on_message, require
@@ -43,6 +43,14 @@ bili_super_admins: List[int] = []
 
 # 映射路径 -> 真实路径 映射，例如 "/bilivideo" -> "C:\\...\\downloads"
 path_mappings: Dict[str, str] = {}
+
+_BILI_TABLE = list("FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf")
+_BILI_REV_TABLE = {alpha: idx for idx, alpha in enumerate(_BILI_TABLE)}
+_BILI_MAX_AVID = 1 << 51          # 2^51
+_BILI_MIN_AVID = 1
+_BILI_XOR_CODE = 23442827791579
+_BILI_MASK_CODE = 2251799813685247
+_BILI_BASE = 58
 
 _processing: Set[str] = set()
 
@@ -301,7 +309,11 @@ def _extract_bili_urls_from_event(event: GroupMessageEvent) -> List[str]:
                 urls.append(av_str)
 
         # 匹配 AV 链接（如 /video/av123456/）
-        for m in re.findall(r"https?://[^\s\"'<>]*/video/av(\d+)", full_text, flags=re.IGNORECASE):
+        for m in re.findall(
+            r"https?://[^\s\"'<>]*/video/av(\d+)",
+            full_text,
+            flags=re.IGNORECASE,
+        ):
             av_url = f"https://www.bilibili.com/video/av{m}/"
             if av_url not in urls:
                 urls.append(av_url)
@@ -309,7 +321,15 @@ def _extract_bili_urls_from_event(event: GroupMessageEvent) -> List[str]:
     except Exception as e:
         logger.debug(f"bili2mp4: 提取链接异常: {e}")
 
-    return urls
+    norm_seen: Set[str] = set()
+    result: List[str] = []
+    for u in urls:
+        norm = _normalize_bili_url(u)
+        if norm not in norm_seen:
+            norm_seen.add(norm)
+            result.append(norm)
+
+    return result
 
 
 def _extract_aid_from_url(url: str) -> Optional[int]:
@@ -338,16 +358,26 @@ def _extract_aid_from_url(url: str) -> Optional[int]:
 def _bili_av_to_bv(aid: int) -> Optional[str]:
     """将 AV 号转换为 BV 号"""
     try:
-        table = "fZodR9XQDSUm21yCkr6zBqiveYah8bt4xsWpHnJE7jL5VG3guMTKNPAwcF"
-        s = [11, 10, 3, 8, 4, 6]
-        xor = 177451812
-        add = 8728348608
+        if not (_BILI_MIN_AVID <= aid < _BILI_MAX_AVID):
+            return None
 
-        x = (aid ^ xor) + add
-        r = list("BV1  4 1 7  ")
-        for i in range(6):
-            r[s[i]] = table[x // 58**i % 58]
-        return "".join(r)
+        r = _BILI_MAX_AVID | aid
+        r ^= _BILI_XOR_CODE
+
+        ans = ["B", "V", "1"] + ["0"] * 9
+        bvidx = len(ans) - 1
+
+        while r:
+            idx = r % _BILI_BASE
+            ans[bvidx] = _BILI_TABLE[idx]
+            r //= _BILI_BASE
+            bvidx -= 1
+
+        # swap(ans, 3, 9); swap(ans, 4, 7)
+        ans[3], ans[9] = ans[9], ans[3]
+        ans[4], ans[7] = ans[7], ans[4]
+
+        return "".join(ans)
     except Exception:
         return None
 
@@ -810,50 +840,54 @@ def _download_with_ytdlp(
 
 
 async def _download_and_send(bot: Bot, group_id: int, url: str) -> None:
-    # 规范化链接
     norm_url = _normalize_bili_url(url)
 
-    # 如果设置了最大时长，通过 API 检查
+    key = f"{group_id}:{norm_url}"
+    if key in _processing:
+        logger.info(f"bili2mp4: 群 {group_id} 正在处理同一视频 {norm_url}，跳过重复任务")
+        return
+
+    _processing.add(key)
     try:
-        if max_duration_sec and max_duration_sec > 0:
+        # 时长限制检查
+        if max_duration_sec:
             dur = _get_bili_duration_seconds(norm_url)
             if dur is not None:
                 if dur > max_duration_sec:
                     logger.info(
-                        f"bili2mp4: 视频时长 {dur}s 超过最大限制 {max_duration_sec}s，跳过下载"
+                        f"bili2mp4: 视频时长 {dur}s 超出限制 {max_duration_sec}s，跳过下载 {norm_url}"
                     )
                     return
                 else:
                     logger.info(
                         f"bili2mp4: 视频时长 {dur}s 在限制 {max_duration_sec}s 内，继续下载"
                     )
-    except Exception as e:
-        logger.debug(f"bili2mp4: 最大时长预检查失败，忽略并继续下载: {e}")
 
-    # 执行下载
-    try:
-        path, title = await asyncio.to_thread(
-            _download_with_ytdlp,
-            norm_url,
-            bilibili_cookie,
-            DOWNLOAD_DIR,
-            max_height,
-            max_filesize_mb,
-        )
-    except (ImportError, RuntimeError) as e:
-        logger.warning(f"下载环境异常: {e}")
-        return
-    except Exception as e:
-        logger.error(f"bili2mp4: 下载异常: {e}")
-        return
+        # 下载视频
+        try:
+            if DOWNLOAD_DIR is None:
+                raise RuntimeError("DOWNLOAD_DIR 未初始化")
+            final_path, title = _download_with_ytdlp(
+                norm_url,
+                bilibili_cookie,
+                DOWNLOAD_DIR,
+                max_height,
+                max_filesize_mb,
+            )
+        except Exception as e:
+            logger.warning(f"bili2mp4: 下载环境异常: {e}")
+            return
 
-    # 检查文件大小和分辨率
-    if not _check_video_file(path):
-        logger.info(f"bili2mp4: 文件 {path} 未通过分辨率检查或已被删除")
-        return
+        # 分辨率检查
+        if not _check_video_file(final_path):
+            logger.warning(f"bili2mp4: 文件检查未通过，跳过发送: {final_path}")
+            return
 
-    # 发送视频
-    await _send_video_with_timeout(bot, group_id, path, title)
+        # 发送视频
+        await _send_video_with_timeout(bot, group_id, final_path, title)
+
+    finally:
+        _processing.discard(key)
 
 
 async def _handle_group_command(
